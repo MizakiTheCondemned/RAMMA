@@ -1,0 +1,75 @@
+# RAMMA v 0 . 667
+# ---------------------------------------------------------------------------
+# Python 3.12 or newer is required. Try to keep within the 3.12.x series. 
+# bs-roformer-infer will not install on anything older, 
+# and some of its dependencies use `X | None` type hints that
+# only work at runtime from 3.12.0 and up. 3.12.10 is recommended.
+#
+# Install into a virtual environment:
+#     py -3.12 -m venv venv
+#     venv\Scripts\activate            (Windows)
+#     source venv/bin/activate         (Linux / macOS)
+#     python -m pip install --upgrade pip
+#     python -m pip install -r requirements.txt
+#
+# PyTorch is listed here as the plain CPU package. For GPU separation, install
+# the CUDA build FIRST, using the command from https://pytorch.org for your
+# driver's CUDA version, e.g.:
+#     python -m pip install torch --index-url https://download.pytorch.org/whl/cu126
+# then run the line above; pip will keep the CUDA build already installed.
+# Check with:
+#     python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+# A version ending in +cu126 and True means the GPU path is active.
+# ---------------------------------------------------------------------------
+
+# --- Interface -------------------------------------------------------------
+customtkinter>=5.2
+# tkinter is NOT on PyPI. It ships with the official Python installer on
+# Windows and macOS; on Debian/Ubuntu install it with:
+#     sudo apt install python3-tk
+
+# --- Audio I/O and playback ------------------------------------------------
+sounddevice>=0.4.6
+soundfile>=0.12
+cffi>=1.16                 # compiled backend sounddevice needs (_cffi_backend)
+
+# --- Numerics --------------------------------------------------------------
+numpy>=1.23
+scipy>=1.10                # resampling, IIR filters for EQ
+
+# --- Separation model ------------------------------------------------------
+torch>=2.0                 # see the CUDA note above
+bs-roformer-infer>=0.1.5   # BS-RoFormer architecture + model registry
+ml-collections>=0.1.1      # reads the model's YAML config
+PyYAML>=6.0
+
+# --- MP3 export ------------------------------------------------------------
+# Only needed for the MP3 320 / MP3 256 export formats. WAV export works
+# without it. pydub also needs FFmpeg installed and on your PATH:
+#     https://ffmpeg.org/download.html
+pydub>=0.25
+
+# --- Mel-Band models (karaoke) ---------------------------------------------
+# Required for any Mel-Band RoFormer, such as becruily's karaoke model: those
+# models ask librosa.filters.mel how many FFT bins belong to each band, and
+# those counts set the width of every mask-estimator layer. RAMMA's built-in
+# filterbank is close but not identical, so the weights will not load without
+# this. Not needed if you only use BS-RoFormer models.
+librosa>=0.10
+
+# ---------------------------------------------------------------------------
+# NOT installed by pip — the model weights.
+#
+# ramma.py runs unwa's BS-Roformer-Resurrection-Inst. Put the .ckpt and the
+# matching .yaml in a "models" folder next to the script:
+#
+#     ramma.py
+#     models\
+#         BS-Roformer-Resurrection-Inst.ckpt
+#         BS-Roformer-Resurrection-Inst.yaml
+#
+# Other folders searched, in order: the script's own folder,
+# ~/.cache/ramma/bs-roformer-resurrection-inst, and the working directory.
+# To point at the files directly instead, set _INST_CKPT_PATH and
+# _INST_CFG_PATH near the top of ramma.py.
+# ---------------------------------------------------------------------------

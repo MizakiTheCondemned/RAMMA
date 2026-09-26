@@ -1,0 +1,31 @@
+NOTE: RAMMA is for CUDA/GPUs at or above 12.6. 
+If you do NOT have a CUDA version above or at 12.6, you have to run RAMMA with CPU, which processes files very very slowly.
+If you do not know which CUDA version you have, go to a new folder and click on the address bar and type cmd, then press enter.
+After that, type nvidia-smi and press enter. Look for CUDA UMD VERSION. It will say 12.x or 13.x. If it is over or at 13.2 you want to pick cu132.
+-
+Python 3.12 or newer is required. Try to keep within the 3.12.x series. 
+bs-roformer-infer will not install on anything older, 
+and some of its dependencies use `X | None` type hints that only work at runtime from 3.12.0 and up. 3.12.10 is recommended.
+-
+Install python from here: https://www.python.org/downloads/windows/ - https://www.python.org/downloads/macos/
+Do take note that I use windows, and am not sure how it works on macos.
+Start the python installation and make sure you tick the boxes for admin rights, and add to PATH, then proceed with the installation.
+If you encounter the option to "disable path lenght limit", choose to do so.
+-
+Extract all files in RAMMA.zip to a new folder.
+-
+Run "RAMMA.bat" in the same folder as where you have "ramma.py" and the "models" folder.
+Pay close attention to the CUDA/GPU options during installation. CUDA/GPU allows you to run the program WAY faster than CPU.
+After downloading everything, you will be asked to fetch ZFTurbo's "mel_band_roformer.py"
+-
+To get "mel_band_roformer.py", go here: 
+https://github.com/ZFTurbo/Music-Source-Separation-Training/blob/main/models/bs_roformer/mel_band_roformer.py
+Click on the button on the right side of the screen with three dots in it [...] and select Download.
+-
+After having downloaded it, place it in the "venv -> Lib -> site-packages -> bs_roformer" - folder.
+Press a key to continue. We're almost ready for launch.  
+RAMMA will start after you press a key again, but you still will need to make the .exe to launch it again.
+
+To start RAMMA again after having closed it once, click on build_start_exe.bat - which needs to be in the same folder as ramma_start.py.
+This will build the program's.exe. Wait for it to finish, then click on RAMMA.exe to run RAMMA.
+Enjoy!

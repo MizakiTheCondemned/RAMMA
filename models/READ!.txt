@@ -1,0 +1,10 @@
+https://huggingface.co/enerjazzer/BS-ROFO-SW-Fixed/tree/main
+Download the .ckpt & .yaml files.
+-
+https://huggingface.co/becruily/mel-band-roformer-karaoke/tree/main
+Download the .ckpt & .yaml files.
+-
+https://huggingface.co/pcunwa/BS-Roformer-Resurrection/tree/main
+Download BS-Roformer-Resurrection-Inst.ckpt & BS-Roformer-Resurrection-Inst-Config.yaml
+
+Place all 6 files in the models folder.
