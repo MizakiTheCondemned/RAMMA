@@ -4,6 +4,8 @@ RAMMA is free for everyone to use. <br>
 I take no credit for creating the program, but I am in the credits. <.< <br>
 All credits go to the kind people helping me that are in the intro splash screen of the program.<br>
 -<br>
+I'm sorry if things are very basic, this is the first time I try to do stuff on github.<br>
+<br>
 The models linked in the models folder that you will need to download were made by: UNWA, BECRUILY, & JARREDOU<br>
 Miss you JARREDOU...<br>
 -<br>
