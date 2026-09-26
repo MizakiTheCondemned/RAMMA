@@ -1,3 +1,4 @@
+Keeping this README here in case something goes wrong with auto-download.
 https://huggingface.co/enerjazzer/BS-ROFO-SW-Fixed/tree/main
 Download the .ckpt & .yaml files.
 -
