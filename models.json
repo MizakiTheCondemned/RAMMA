@@ -1,0 +1,52 @@
+{
+  "_comment": [
+    "Files RAMMA downloads on first run. Edit the urls to point at your",
+    "own copies. sha256 is optional: when present the file is verified",
+    "after downloading and a corrupt download is discarded.",
+    "required=false means the program runs without it."
+  ],
+  "files": [
+    {
+      "name": "BS-Rofo-SW-Fixed.ckpt",
+      "url": "https://huggingface.co/<user>/<repo>/resolve/main/BS-Rofo-SW-Fixed.ckpt",
+      "sha256": "",
+      "required": true,
+      "note": "six-stem separator"
+    },
+    {
+      "name": "BS-Rofo-SW-Fixed.yaml",
+      "url": "https://huggingface.co/<user>/<repo>/resolve/main/BS-Rofo-SW-Fixed.yaml",
+      "sha256": "",
+      "required": true,
+      "note": "its config"
+    },
+    {
+      "name": "BS-Roformer-Resurrection-Inst.ckpt",
+      "url": "https://huggingface.co/<user>/<repo>/resolve/main/BS-Roformer-Resurrection-Inst.ckpt",
+      "sha256": "",
+      "required": false,
+      "note": "instrumental model"
+    },
+    {
+      "name": "BS-Roformer-Resurrection-Inst.yaml",
+      "url": "https://huggingface.co/<user>/<repo>/resolve/main/BS-Roformer-Resurrection-Inst.yaml",
+      "sha256": "",
+      "required": false,
+      "note": "its config"
+    },
+    {
+      "name": "mel_band_roformer_karaoke_becruily.ckpt",
+      "url": "https://huggingface.co/becruily/mel-band-roformer-karaoke/resolve/main/mel_band_roformer_karaoke_becruily.ckpt",
+      "sha256": "",
+      "required": false,
+      "note": "lead / backing vocal split"
+    },
+    {
+      "name": "config_karaoke_becruily.yaml",
+      "url": "https://huggingface.co/becruily/mel-band-roformer-karaoke/resolve/main/config_karaoke_becruily.yaml",
+      "sha256": "",
+      "required": false,
+      "note": "its config"
+    }
+  ]
+}

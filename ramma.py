@@ -682,6 +682,205 @@ def _import_bs_roformer():
         )
         return _bsr_import_cache
 
+# ============================================================
+# MODEL DOWNLOADER
+# The checkpoints are far too large for a git repository, so the program
+# fetches them on first run from the links in models.json (written beside
+# this file the first time it runs, then yours to edit). Nothing is
+# downloaded if the file is already there.
+# ============================================================
+_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+_MANIFEST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "models.json")
+
+# Written out when models.json is missing. Fill in your own links: a Hugging
+# Face file link works as-is — the "/blob/" form is rewritten to "/resolve/".
+_DEFAULT_MANIFEST = {
+    "_comment": [
+        "Files RAMMA downloads on first run. Edit the urls to point at your",
+        "own copies. sha256 is optional: when present the file is verified",
+        "after downloading and a corrupt download is discarded.",
+        "required=false means the program runs without it.",
+    ],
+    "files": [
+        {"name": "BS-Rofo-SW-Fixed.ckpt",
+         "url": "https://huggingface.co/<user>/<repo>/resolve/main/BS-Rofo-SW-Fixed.ckpt",
+         "sha256": "", "required": True,
+         "note": "six-stem separator"},
+        {"name": "BS-Rofo-SW-Fixed.yaml",
+         "url": "https://huggingface.co/<user>/<repo>/resolve/main/BS-Rofo-SW-Fixed.yaml",
+         "sha256": "", "required": True,
+         "note": "its config"},
+        {"name": "BS-Roformer-Resurrection-Inst.ckpt",
+         "url": "https://huggingface.co/<user>/<repo>/resolve/main/BS-Roformer-Resurrection-Inst.ckpt",
+         "sha256": "", "required": False,
+         "note": "instrumental model"},
+        {"name": "BS-Roformer-Resurrection-Inst.yaml",
+         "url": "https://huggingface.co/<user>/<repo>/resolve/main/BS-Roformer-Resurrection-Inst.yaml",
+         "sha256": "", "required": False,
+         "note": "its config"},
+        {"name": "mel_band_roformer_karaoke_becruily.ckpt",
+         "url": "https://huggingface.co/becruily/mel-band-roformer-karaoke/resolve/main/mel_band_roformer_karaoke_becruily.ckpt",
+         "sha256": "", "required": False,
+         "note": "lead / backing vocal split"},
+        {"name": "config_karaoke_becruily.yaml",
+         "url": "https://huggingface.co/becruily/mel-band-roformer-karaoke/resolve/main/config_karaoke_becruily.yaml",
+         "sha256": "", "required": False,
+         "note": "its config"},
+    ],
+}
+
+
+def _hf_direct(url):
+    """A Hugging Face page link turned into a direct download link."""
+    if "huggingface.co" in url and "/blob/" in url:
+        url = url.replace("/blob/", "/resolve/")
+    if "huggingface.co" in url and "download=true" not in url:
+        url += ("&" if "?" in url else "?") + "download=true"
+    return url
+
+
+def _read_manifest():
+    """The download list, creating a template beside the script if missing."""
+    try:
+        if not os.path.exists(_MANIFEST_PATH):
+            with open(_MANIFEST_PATH, "w", encoding="utf-8") as f:
+                json.dump(_DEFAULT_MANIFEST, f, indent=2)
+            print(f"[Models] Wrote a template to {_MANIFEST_PATH} — put your "
+                  f"own links in it.")
+        with open(_MANIFEST_PATH, "r", encoding="utf-8") as f:
+            return json.load(f).get("files", [])
+    except Exception as e:
+        print("[Models] Could not read models.json:", e)
+        return []
+
+
+def _sha256_of(path, chunk=1 << 20):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _download_file(url, dest, expect_sha="", progress=None):
+    """Fetch *url* to *dest*, resuming a part-file and verifying if asked.
+
+    Downloads to dest.part first, so an interrupted run never leaves a
+    half-written checkpoint that looks complete.
+    """
+    import urllib.request
+    url = _hf_direct(url)
+    part = dest + ".part"
+    have = os.path.getsize(part) if os.path.exists(part) else 0
+
+    req = urllib.request.Request(url, headers={"User-Agent": "RAMMA"})
+    if have:
+        req.add_header("Range", f"bytes={have}-")
+    try:
+        resp = urllib.request.urlopen(req, timeout=60)
+    except Exception as e:
+        if have:                      # the server may refuse to resume
+            os.remove(part)
+            return _download_file(url, dest, expect_sha, progress)
+        raise RuntimeError(f"could not start the download: {e}")
+
+    total = int(resp.headers.get("Content-Length", 0) or 0)
+    if resp.status == 206:
+        total += have
+    elif have:
+        have = 0                      # not a resume after all: start over
+
+    mode = "ab" if (have and resp.status == 206) else "wb"
+    done = have if mode == "ab" else 0
+    last = -1
+    with open(part, mode) as f:
+        while True:
+            block = resp.read(1 << 20)
+            if not block:
+                break
+            f.write(block)
+            done += len(block)
+            if total and progress:
+                pct = int(done * 100 / total)
+                if pct != last:
+                    last = pct
+                    progress(pct, done, total)
+
+    if expect_sha:
+        got = _sha256_of(part)
+        if got.lower() != expect_sha.lower():
+            os.remove(part)
+            raise RuntimeError(f"checksum mismatch (expected {expect_sha[:12]}…, "
+                               f"got {got[:12]}…) — the file was discarded")
+    os.replace(part, dest)
+    return dest
+
+
+def missing_model_files():
+    """Entries from the manifest whose file is not on disk yet."""
+    out = []
+    for entry in _read_manifest():
+        name = entry.get("name", "")
+        if not name:
+            continue
+        if not os.path.exists(os.path.join(_MODELS_DIR, name)):
+            out.append(entry)
+    return out
+
+
+def download_models(only_required=False, status=None):
+    """Fetch whatever is missing. Returns (fetched, failed)."""
+    os.makedirs(_MODELS_DIR, exist_ok=True)
+    missing = [e for e in missing_model_files()
+               if e.get("required", True) or not only_required]
+    if not missing:
+        print("[Models] Everything is already in the models folder")
+        return 0, 0
+
+    fetched = failed = 0
+    for entry in missing:
+        name = entry["name"]
+        url = entry.get("url", "")
+        if not url or "<user>" in url:
+            print(f"[Models] {name}: no link set in models.json — skipped")
+            failed += 1
+            continue
+        dest = os.path.join(_MODELS_DIR, name)
+        note = entry.get("note", "")
+        print(f"[Models] Downloading {name} ({note})…")
+
+        def _prog(pct, done, total, _n=name):
+            msg = f"{_n}  {pct}%  ({done / 1e6:.0f} / {total / 1e6:.0f} MB)"
+            if status:
+                status(msg)
+            if pct % 10 == 0:
+                print(f"[Models]   {msg}")
+
+        try:
+            _download_file(url, dest, entry.get("sha256", ""), _prog)
+            print(f"[Models] {name} ready")
+            fetched += 1
+        except Exception as e:
+            print(f"[Models] {name} failed: {e}")
+            failed += 1
+    return fetched, failed
+
+
+# A fresh copy of RAMMA has no model files. Fetch whatever models.json lists
+# and the models folder lacks, before anything tries to load them.
+try:
+    _missing = missing_model_files()
+    if _missing:
+        _names = ", ".join(e["name"] for e in _missing)
+        print(f"[Models] Missing: {_names}")
+        _splash_set(0.16, "DOWNLOADING MODELS…")
+        download_models(status=lambda msg: _splash_set(0.18, msg[:42].upper()))
+except Exception as _e:
+    print("[Models] Download step skipped:", _e)
+
+
 # The six-stem model normally downloads itself into _BSR_CACHE, but a local
 # copy is used when there is one — so both models can live side by side in the
 # models folder:
