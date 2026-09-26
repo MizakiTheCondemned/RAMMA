@@ -8,28 +8,28 @@
   "files": [
     {
       "name": "BS-Rofo-SW-Fixed.ckpt",
-      "url": "https://huggingface.co/<user>/<repo>/resolve/main/BS-Rofo-SW-Fixed.ckpt",
+      "url": "https://huggingface.co/enerjazzer/BS-ROFO-SW-Fixed/blob/main/BS-Rofo-SW-Fixed.ckpt",
       "sha256": "",
       "required": true,
       "note": "six-stem separator"
     },
     {
       "name": "BS-Rofo-SW-Fixed.yaml",
-      "url": "https://huggingface.co/<user>/<repo>/resolve/main/BS-Rofo-SW-Fixed.yaml",
+      "url": "https://huggingface.co/enerjazzer/BS-ROFO-SW-Fixed/blob/main/BS-Rofo-SW-Fixed.yaml",
       "sha256": "",
       "required": true,
       "note": "its config"
     },
     {
       "name": "BS-Roformer-Resurrection-Inst.ckpt",
-      "url": "https://huggingface.co/<user>/<repo>/resolve/main/BS-Roformer-Resurrection-Inst.ckpt",
+      "url": "https://huggingface.co/pcunwa/BS-Roformer-Resurrection/blob/main/BS-Roformer-Resurrection-Inst.ckpt",
       "sha256": "",
       "required": false,
       "note": "instrumental model"
     },
     {
       "name": "BS-Roformer-Resurrection-Inst.yaml",
-      "url": "https://huggingface.co/<user>/<repo>/resolve/main/BS-Roformer-Resurrection-Inst.yaml",
+      "url": "https://huggingface.co/pcunwa/BS-Roformer-Resurrection/blob/main/BS-Roformer-Resurrection-Inst-Config.yaml",
       "sha256": "",
       "required": false,
       "note": "its config"
