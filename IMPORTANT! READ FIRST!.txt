@@ -12,8 +12,6 @@ Do take note that I use windows, and am not sure how it works on macos.
 Start the python installation and make sure you tick the boxes for admin rights, and add to PATH, then proceed with the installation.
 If you encounter the option to "disable path lenght limit", choose to do so.
 -
-Extract all files in RAMMA.zip to a new folder.
--
 Run "RAMMA.bat" in the same folder as where you have "ramma.py" and the "models" folder.
 Pay close attention to the CUDA/GPU options during installation. CUDA/GPU allows you to run the program WAY faster than CPU.
 After downloading everything, you will be asked to fetch ZFTurbo's "mel_band_roformer.py"
