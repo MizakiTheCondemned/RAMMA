@@ -566,6 +566,32 @@ def _chunking_from_config(cfg, sr, fallback_chunk=None):
             chunk_s = max(4.0, min(_MAX_MODEL_CHUNK_S, raw))
     except Exception:
         pass
+
+    # Snap the chunk down to a whole number of STFT frames. The model turns
+    # each chunk into frames of stft_hop_length samples; a chunk that is not
+    # a multiple of that leaves a ragged part-frame at the end of every
+    # chunk, which lands right where chunks are stitched together and takes
+    # the edges — the weakest part of the output — with it. Note this is
+    # stft_hop_length, not audio.hop_length: the two differ in some configs
+    # and it is the former the model actually uses.
+    try:
+        hop = int(cfg.model.get("stft_hop_length", 0) or 0)
+    except Exception:
+        hop = 0
+    if not hop:
+        try:
+            hop = int(cfg.audio.hop_length)
+        except Exception:
+            hop = 0
+    if hop > 0:
+        samples = int(chunk_s * float(sr or 44100))
+        snapped = (samples // hop) * hop
+        if snapped >= hop and snapped != samples:
+            print(f"[Chunking] {samples} samples is {samples / hop:.3f} STFT "
+                  f"frames of {hop}; using {snapped} ({snapped // hop} whole "
+                  f"frames) so chunks line up with the model's own grid")
+        if snapped >= hop:
+            chunk_s = snapped / float(sr or 44100)
     try:
         num_overlap = int(cfg.inference.num_overlap)
     except Exception:
