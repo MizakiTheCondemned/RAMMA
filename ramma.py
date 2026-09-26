@@ -261,7 +261,7 @@ _sp_bar_fill = tk.Frame(_sp_bar_bg, bg=RED)
 _sp_bar_fill.place(x=1, y=1, width=0, height=12)
 
 # Animated byline — cycles red → purple → gold
-_sp_byline = tk.Label(_sp_inner, text="Program made by: Sai & Eidii with help from megy, Denchik Games, Maggot, and trexmus - Models by: becruily & unwa",
+_sp_byline = tk.Label(_sp_inner, text="Program made by: Sai & Eidii with help from megy, Denchik Games, Maggot, deton24 and trexmus - Models by: becruily, jarredou & unwa",
                        font=("Courier New", 11, "bold"),
                        fg=GLOW_RED, bg=BG)
 # Long credits: prefer wrapping onto a second line over shrinking the type
