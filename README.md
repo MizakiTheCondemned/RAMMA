@@ -13,4 +13,4 @@ INSTALLATION:<br>
 Read the "IMPORTANT! READ FIRST!" text file.
 <br>
 MODEL INSTALLATION:
-Read the "READ!" text file in the models folder.
+The models should download automatically upon first run, but if not, read the "READ!" text file in the models folder.
