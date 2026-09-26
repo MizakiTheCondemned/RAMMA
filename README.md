@@ -1,15 +1,14 @@
 # RAMMA
-RAMMA version 0.667
-RAMMA is free for everyone to use. 
-I take no credit for creating the program, but I am in the credits. <.<
-All credits go to the kind people helping me that are in the intro splash screen of the program.
--
-The models linked in the models folder that you will need to download were made by:
-UNWA, BECRUILY, & JARREDOU
-Miss you JARREDOU...
--
-INSTALLATION:
+RAMMA version 0.667 <br>
+RAMMA is free for everyone to use. <br>
+I take no credit for creating the program, but I am in the credits. <.< <br>
+All credits go to the kind people helping me that are in the intro splash screen of the program.<br>
+-<br>
+The models linked in the models folder that you will need to download were made by: UNWA, BECRUILY, & JARREDOU<br>
+Miss you JARREDOU...<br>
+-<br>
+INSTALLATION:<br>
 Read the "IMPORTANT! READ FIRST!" text file.
-
+<br>
 MODEL INSTALLATION:
 Read the "READ!" text file in the models folder.
