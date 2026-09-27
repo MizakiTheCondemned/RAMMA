@@ -11,6 +11,7 @@ I'm sorry if things are very basic, this is the first time I try to do stuff on 
 It is the first time I try making a program.
 
 The models linked in the models folder that will automatically download upon first launch were made by: UNWA, GILLIAAN, BECRUILY, & JARREDOU
+
 Miss you JARREDOU...
 
 INSTALLATION:
