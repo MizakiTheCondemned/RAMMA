@@ -4,11 +4,13 @@ RAMMA version 0.667
 RAMMA is free for everyone to use.
 
 I take no credit for creating the program, but I am in the credits. <.<
+
 All credits go to the kind people helping me that are in the intro splash screen of the program.
 
-I'm sorry if things are very basic, this is the first time I try to do stuff on github.<br>
-It is the first time I try making a program.<br>
-The models linked in the models folder that you will need to download (unless they automatically download) were made by: UNWA, GILLIAAN, BECRUILY, & JARREDOU
+I'm sorry if things are very basic, this is the first time I try to do stuff on github.
+It is the first time I try making a program.
+
+The models linked in the models folder that will automatically download upon first launch were made by: UNWA, GILLIAAN, BECRUILY, & JARREDOU
 Miss you JARREDOU...
 
 INSTALLATION:
