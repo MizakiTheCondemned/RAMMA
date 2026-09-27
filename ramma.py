@@ -1,6 +1,7 @@
 import customtkinter as ctk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 import tkinter as tk
+import shutil
 import sounddevice as sd
 import soundfile as sf
 import numpy as np
@@ -261,7 +262,7 @@ _sp_bar_fill = tk.Frame(_sp_bar_bg, bg=RED)
 _sp_bar_fill.place(x=1, y=1, width=0, height=12)
 
 # Animated byline — cycles red → purple → gold
-_sp_byline = tk.Label(_sp_inner, text="Program made by: Sai & Eidii with help from megy, Denchik Games, Maggot, deton24 and trexmus - Models by: becruily, jarredou & unwa",
+_sp_byline = tk.Label(_sp_inner, text="Program made by: Sai & Eidii with help from megy, Denchik Games, Maggot, deton24, Dudumil and trexmus - Models by: becruily, jarredou, gilliaan & unwa",
                        font=("Courier New", 11, "bold"),
                        fg=GLOW_RED, bg=BG)
 # Long credits: prefer wrapping onto a second line over shrinking the type
@@ -709,6 +710,181 @@ def _import_bs_roformer():
         return _bsr_import_cache
 
 # ============================================================
+# AUTO-UPDATE
+# Checks the GitHub repository for a newer ramma.py and offers to install it.
+# The new file is compiled before it replaces anything, and the running one
+# is kept as a backup, so a bad or truncated download cannot leave you
+# without a working program.
+# ============================================================
+_UPDATE_REPO   = ""            # "user/repo" — set this to switch updates on
+_UPDATE_BRANCH = "main"
+_UPDATE_FILE   = "ramma.py"    # the file in the repo to track
+_UPDATE_CHECK  = True          # look for updates at start-up
+_UPDATE_ASK    = True          # ask before installing; False installs quietly
+_UPDATE_STATE  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "ramma_update.json")
+
+
+def _update_state():
+    try:
+        with open(_UPDATE_STATE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_update_state(data):
+    try:
+        with open(_UPDATE_STATE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+    except Exception as e:
+        print("[Update] Could not save update state:", e)
+
+
+def _github_commit_info():
+    """(date, message) of the newest commit, for the prompt. Optional.
+
+    Purely cosmetic: GitHub's API is rate-limited for anonymous callers and
+    returns 403 often enough that the update must not depend on it. The
+    check itself compares file contents instead.
+    """
+    import urllib.request
+    try:
+        url = (f"https://api.github.com/repos/{_UPDATE_REPO}/commits"
+               f"?sha={_UPDATE_BRANCH}&path={_UPDATE_FILE}&per_page=1")
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "RAMMA",
+            "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.load(resp)
+        if data:
+            top = data[0]
+            return (top.get("commit", {}).get("committer", {}).get("date", ""),
+                    (top.get("commit", {}).get("message", "") or "").split("\n")[0])
+    except Exception:
+        pass
+    return "", ""
+
+
+def _download_update():
+    """Fetch the tracked file from the branch; returns its text."""
+    import urllib.request
+    url = (f"https://raw.githubusercontent.com/{_UPDATE_REPO}/"
+           f"{_UPDATE_BRANCH}/{_UPDATE_FILE}")
+    req = urllib.request.Request(url, headers={"User-Agent": "RAMMA"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read().decode("utf-8")
+
+
+def _text_hash(text):
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def install_update(new_hash, text):
+    """Replace this file with *text*, keeping the current one as a backup."""
+    me = os.path.abspath(__file__)
+    # Refuse anything that will not compile or is obviously truncated.
+    if len(text) < 10000:
+        print(f"[Update] The download is only {len(text)} bytes — ignoring it.")
+        return False
+    try:
+        compile(text, me, "exec")
+    except SyntaxError as e:
+        print(f"[Update] The downloaded file does not compile ({e}); "
+              f"keeping the current one.")
+        return False
+
+    backup = me + ".bak"
+    try:
+        shutil.copy2(me, backup)
+        with open(me, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception as e:
+        print("[Update] Could not write the update:", e)
+        return False
+
+    _save_update_state({"hash": new_hash,
+                        "installed": time.strftime("%Y-%m-%d %H:%M:%S")})
+    print(f"[Update] Installed. The previous version is at "
+          f"{os.path.basename(backup)} — restart RAMMA to use the new one.")
+    return True
+
+
+def check_for_update(quiet=True):
+    """Compare this file with the one in the repository and offer the update.
+
+    Contents are compared rather than commit ids: it needs only
+    raw.githubusercontent.com, which has no rate limit for this, and it
+    answers the question that actually matters — is the published file
+    different from the one running?
+    """
+    if not _UPDATE_REPO:
+        if not quiet:
+            print("[Update] No repository set (_UPDATE_REPO near the top).")
+        return None
+    try:
+        text = _download_update()
+    except Exception as e:
+        print(f"[Update] Could not reach GitHub: {e}")
+        return None
+
+    new_hash = _text_hash(text)
+    try:
+        with open(os.path.abspath(__file__), "r", encoding="utf-8") as f:
+            mine = _text_hash(f.read())
+    except Exception:
+        mine = ""
+
+    if new_hash == mine:
+        _save_update_state({"hash": new_hash, "checked": time.strftime("%Y-%m-%d %H:%M:%S")})
+        if not quiet:
+            print("[Update] Already up to date.")
+        return False
+    if _update_state().get("skipped") == new_hash:
+        if not quiet:
+            print("[Update] A newer version is available but was skipped.")
+        return False
+
+    date, message = _github_commit_info()
+    print(f"[Update] A different version is on GitHub "
+          f"({len(text)} bytes, {new_hash[:8]})"
+          + (f" — {message} ({date})" if message else ""))
+
+    def _proceed():
+        if install_update(new_hash, text) and running:
+            try:
+                messagebox.showinfo(
+                    "RAMMA updated",
+                    "RAMMA has been updated.\n\nRestart it to use the new "
+                    "version.\nThe previous one was kept as ramma.py.bak.")
+            except Exception:
+                pass
+
+    if not _UPDATE_ASK:
+        _proceed()
+        return True
+    if running:
+        def _ask():
+            try:
+                if messagebox.askyesno(
+                        "RAMMA — update available",
+                        "A newer version of RAMMA is on GitHub.\n\n"
+                        + (f"{message}\n({date})\n\n" if message else "")
+                        + "Install it now?\nYour current file is kept as "
+                          "ramma.py.bak."):
+                    threading.Thread(target=_proceed, daemon=True).start()
+                else:
+                    st = _update_state()
+                    st["skipped"] = new_hash
+                    _save_update_state(st)
+            except Exception:
+                pass
+        app.after(0, _ask)
+    return True
+
+
+# ============================================================
 # MODEL DOWNLOADER
 # The checkpoints are far too large for a git repository, so the program
 # fetches them on first run from the links in models.json (written beside
@@ -743,6 +919,14 @@ _DEFAULT_MANIFEST = {
          "note": "instrumental model"},
         {"name": "BS-Roformer-Resurrection-Inst.yaml",
          "url": "https://huggingface.co/<user>/<repo>/resolve/main/BS-Roformer-Resurrection-Inst.yaml",
+         "sha256": "", "required": False,
+         "note": "its config"},
+        {"name": "bowed_strings.ckpt",
+         "url": "https://huggingface.co/<user>/<repo>/resolve/main/bowed_strings.ckpt",
+         "sha256": "", "required": False,
+         "note": "gilliaan's bowed strings model"},
+        {"name": "bowed_strings.yaml",
+         "url": "https://huggingface.co/<user>/<repo>/resolve/main/bowed_strings.yaml",
          "sha256": "", "required": False,
          "note": "its config"},
         {"name": "mel_band_roformer_karaoke_becruily.ckpt",
@@ -953,6 +1137,57 @@ _INST_SEARCH_DIRS = [
 # A file whose name contains any of these is preferred when a folder holds
 # several checkpoints.
 _INST_NAME_HINTS = ("resurrection", "unwa", "inst")
+
+# ── gilliaan's bowed strings model ─────────────────────────────────────────
+# Same arrangement as the instrumental model: point these at the files, or
+# drop them in the models folder and let the name hints find them.
+_STR_CKPT_PATH = ""
+_STR_CFG_PATH  = ""
+_STR_SEARCH_DIRS = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),
+    os.path.dirname(os.path.abspath(__file__)),
+    os.getcwd(),
+]
+_STR_NAME_HINTS = ("bowed", "string", "gilliaan")
+_STR_AUTO   = True        # run the strings model after every track
+_STR_QUICK  = True        # fill the cell from OTHER until the model has run,
+                          # exactly as the instrumental cell does. No switch:
+                          # it costs nothing and is replaced by the model.
+_STR_TITLE  = "BOWED STRINGS"
+_STR_CREDIT = "by gilliaan"
+
+strings_model       = None
+strings_model_ready = False
+_strings_separating = False
+_str_load_lock   = threading.Lock()
+_str_sr          = 44100
+_str_stem_idx    = 0
+_str_chunk_s     = 8.0
+_str_overlap_s   = _OVERLAP_SECONDS
+
+
+def _str_find_files():
+    """Locate the bowed-strings checkpoint and config."""
+    ck = _STR_CKPT_PATH if _STR_CKPT_PATH and os.path.isfile(_STR_CKPT_PATH) else None
+    cf = _STR_CFG_PATH  if _STR_CFG_PATH  and os.path.isfile(_STR_CFG_PATH)  else None
+    if ck and cf:
+        return ck, cf
+    for folder in _STR_SEARCH_DIRS:
+        if not os.path.isdir(folder):
+            continue
+        cks, cfs = [], []
+        for name in os.listdir(folder):
+            low = name.lower()
+            full = os.path.join(folder, name)
+            if not any(h in low for h in _STR_NAME_HINTS):
+                continue
+            if low.endswith((".ckpt", ".pth", ".th")):
+                cks.append(full)
+            elif low.endswith((".yaml", ".yml")):
+                cfs.append(full)
+        if cks and cfs:
+            return sorted(cks)[0], sorted(cfs)[0]
+    return ck, cf
 
 # Names belonging to the six-stem model. A file matching one of these is never
 # taken as the instrumental model, however it is named on disk.
@@ -1416,6 +1651,67 @@ def _split_halves_exist():
     return state.fv_data is not None or state.bg_vocals_data is not None
 
 
+# STRINGS is taken out of the same material as OTHER — the quick mix is a
+# copy of it, and the model pulls the strings out of the full mix, most of
+# which sits in OTHER. Playing both therefore counts that material twice and
+# the level jumps. They are treated as one pair, like VOCALS and its halves:
+# one of them plays at a time.
+_other_muted_by_strings = [False]
+
+
+def _strings_live():
+    """True when the STRINGS cell holds audio and is not muted."""
+    return (state.strings_data is not None
+            and not state.stem_mute.get("strings", False))
+
+
+def _swap_to_strings():
+    """Hand OTHER's place to STRINGS, as the split does for the vocals."""
+    if state.strings_data is None:
+        return
+    if not state.stem_mute.get("other", False):
+        state.stem_mute["other"] = True
+        _other_muted_by_strings[0] = True
+    state.stem_mute["strings"] = False
+    for _k in ("other", "strings"):
+        try:
+            _paint_ms(_k)
+        except (NameError, KeyError):
+            pass
+
+
+def _strings_toggled():
+    """The STRINGS M button: switch between STRINGS and OTHER."""
+    if _strings_live():
+        if not state.stem_mute.get("other", False):
+            state.stem_mute["other"] = True
+            _other_muted_by_strings[0] = True
+    elif _other_muted_by_strings[0]:
+        state.stem_mute["other"] = False
+        _other_muted_by_strings[0] = False
+    for _k in ("other", "strings"):
+        try:
+            _paint_ms(_k)
+        except (NameError, KeyError):
+            pass
+
+
+def _other_toggled():
+    """The OTHER M button: bringing it back mutes STRINGS, and vice versa."""
+    if not state.stem_mute.get("other", False):
+        _other_muted_by_strings[0] = False
+        if _strings_live():
+            state.stem_mute["strings"] = True
+    elif state.strings_data is not None and \
+            state.stem_mute.get("strings", False):
+        state.stem_mute["strings"] = False
+    for _k in ("other", "strings"):
+        try:
+            _paint_ms(_k)
+        except (NameError, KeyError):
+            pass
+
+
 def _vocals_toggled_with_split():
     """VOCALS and the two split halves are the same vocal: play one or the other.
 
@@ -1504,6 +1800,22 @@ def _resample_to(audio, from_sr, to_sr):
         _rp(audio[:, 0], up, down).astype(np.float32),
         _rp(audio[:, 1], up, down).astype(np.float32),
     ], axis=1)
+
+
+def _quick_strings(stems):
+    """A stand-in strings part, taken from the six-stem split.
+
+    Bowed strings mostly land in OTHER (with some in GUITAR), so that is
+    what fills the cell the moment the stems arrive — something to hear and
+    mix with straight away. gilliaan's model replaces it when its pass
+    finishes, exactly as unwa's model replaces the quick instrumental.
+    """
+    if not stems:
+        return None
+    part = stems.get("other")
+    if part is None:
+        return None
+    return part.copy()
 
 
 def _quick_instrumental(stems):
@@ -1911,6 +2223,210 @@ def separate_bg_vocals(into=None, cancel=None):
                 app.after(0, _update_fv_button)
 
 
+def load_strings_model():
+    """Load gilliaan's bowed-strings model, in the same way as the others."""
+    global strings_model, strings_model_ready, _str_sr, _str_stem_idx
+    global _str_chunk_s, _str_overlap_s
+    with _str_load_lock:
+        if strings_model_ready:
+            return
+        try:
+            ckpt_path, cfg_path = _str_find_files()
+            if not ckpt_path or not cfg_path:
+                raise FileNotFoundError(
+                    "Bowed-strings model not found. Put gilliaan's .ckpt and "
+                    f".yaml in {_STR_SEARCH_DIRS[0]!r} (models.json can "
+                    "download them), or set _STR_CKPT_PATH / _STR_CFG_PATH.")
+            if _is_main_model_file(ckpt_path) or _is_main_model_file(cfg_path):
+                raise RuntimeError(
+                    f"{os.path.basename(ckpt_path)} is the six-stem model — "
+                    "not a strings model.")
+            print(f"[Strings] Checkpoint: {ckpt_path}")
+            print(f"[Strings] Config:     {cfg_path}")
+
+            import yaml
+            _bsr = _import_bs_roformer()
+            get_model_from_config = _bsr["get_model_from_config"]
+            _YL = _bsr["yaml_loader"]
+            from ml_collections import ConfigDict
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                str_cfg = ConfigDict(yaml.load(f, Loader=_YL))
+
+            try:
+                _str_sr = int(str_cfg.audio.sample_rate)
+            except Exception:
+                _str_sr = 44100
+            _str_chunk_s, _str_overlap_s = _chunking_from_config(str_cfg, _str_sr)
+            print(f"[Strings] Chunking from config: {_str_chunk_s:.2f}s chunks, "
+                  f"{_str_overlap_s:.2f}s overlap per side")
+
+            # Mel-band models need the real librosa (see the karaoke loader).
+            is_mel = ("mel" in os.path.basename(cfg_path).lower()
+                      or "mel" in os.path.basename(ckpt_path).lower()
+                      or bool(str_cfg.model.get("num_bands", 0)))
+            if is_mel and not _librosa_ok:
+                raise RuntimeError(
+                    "This is a Mel-Band model and needs the real librosa: "
+                    "python -m pip install librosa")
+            arch = "mel_band_roformer" if is_mel else "bs_roformer"
+            if is_mel:
+                # ZFTurbo's mel_band_roformer.py imports models.bs_roformer;
+                # point that at the installed package (as the karaoke loader
+                # does) so the import resolves.
+                try:
+                    import bs_roformer as _bsr_pkg
+                    if "models" not in sys.modules:
+                        _shim = types.ModuleType("models")
+                        _shim.__path__ = []
+                        sys.modules["models"] = _shim
+                    sys.modules.setdefault("models.bs_roformer", _bsr_pkg)
+                    setattr(sys.modules["models"], "bs_roformer", _bsr_pkg)
+                except Exception:
+                    pass
+
+            m = get_model_from_config(arch, str_cfg)
+            if m is None:
+                raise RuntimeError("get_model_from_config returned None")
+
+            sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            if isinstance(sd, dict) and "state_dict" in sd:
+                sd = sd["state_dict"]
+            if isinstance(sd, dict):
+                sd = {k[7:] if k.startswith("module.") else k: v
+                      for k, v in sd.items()}
+            m.load_state_dict(sd)
+
+            # Which output holds the strings?
+            _str_stem_idx = 0
+            try:
+                stems = [str(x).lower() for x in str_cfg.training.instruments]
+                print(f"[Strings] Stems in config: {stems}")
+                for i, name in enumerate(stems):
+                    if any(t in name for t in ("string", "bowed", "violin",
+                                               "cello", "orchestr")):
+                        _str_stem_idx = i
+                        break
+            except Exception:
+                pass
+
+            m.to(device)
+            m.eval()
+            strings_model = m
+            print(f"[Strings] Model ready on {device} ({_str_sr} Hz, "
+                  f"stem index {_str_stem_idx})")
+        except Exception as e:
+            print(f"[Strings] Failed to load model: {e}")
+        strings_model_ready = True
+
+
+def separate_strings(path, cancel=None):
+    """Run the bowed-strings model over *path* into state.strings_data."""
+    global _strings_separating
+    if _strings_separating:
+        return
+    if not strings_model_ready:
+        load_strings_model()
+    if strings_model is None:
+        print("[Strings] No model loaded — the STRINGS cell stays empty.")
+        return
+
+    _strings_separating = True
+    _fg_enter()
+    try:
+        audio, file_sr = _read_audio_file(path)
+        audio = _resample_audio(audio, file_sr)
+        sr_i = int(state.sr or _str_sr)
+        x_full = audio.T.astype(np.float32)          # (2, N)
+        n_samples = x_full.shape[1]
+
+        chunk_n   = int(_str_chunk_s * sr_i)
+        overlap_n = int(_str_overlap_s * sr_i)
+        step_n    = max(1, chunk_n - 2 * overlap_n)
+        fade = np.ones(chunk_n, dtype=np.float32)
+        if overlap_n > 0:
+            fade[:overlap_n]  = np.linspace(0, 1, overlap_n)
+            fade[-overlap_n:] = np.linspace(1, 0, overlap_n)
+
+        out = np.zeros((2, n_samples), dtype=np.float32)
+        wgt = np.zeros(n_samples, dtype=np.float32)
+
+        starts   = list(range(0, n_samples, step_n))
+        n_chunks = len(starts)
+        batch_n  = _batch_size_for(device, chunk_n / sr_i)
+        use_fp16 = _INFER_FP16
+        run_device = device
+        ci = 0
+        t0 = time.time()
+
+        with _infer_ctx():
+            i = 0
+            while i < len(starts):
+                if cancel is not None and cancel.is_set():
+                    print("[Strings] Cancelled")
+                    return
+                batch_starts = starts[i:i + batch_n]
+                chunks, kept = [], []
+                for st_i in batch_starts:
+                    seg = x_full[:, st_i:st_i + chunk_n]
+                    if seg.shape[1] < chunk_n:
+                        seg = np.pad(seg, ((0, 0), (0, chunk_n - seg.shape[1])))
+                    chunks.append(seg)
+                    kept.append(st_i)
+                try:
+                    xb = torch.from_numpy(np.ascontiguousarray(np.stack(chunks)))
+                    xb = (xb.pin_memory().to(run_device, non_blocking=True)
+                          if run_device.type == "cuda" else xb.to(run_device))
+                    with _amp_ctx(run_device, use_fp16):
+                        pred = strings_model(xb)
+                    arr = pred.float().cpu().numpy()
+                except RuntimeError as e:
+                    if run_device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    if batch_n > 1:
+                        batch_n = max(1, batch_n // 2)
+                        print(f"[Strings] {e}\n[Strings] Retrying with batch {batch_n}")
+                        continue
+                    if use_fp16:
+                        use_fp16 = False
+                        print(f"[Strings] {e}\n[Strings] Retrying in full precision")
+                        continue
+                    raise
+
+                # (B, stems, 2, T) or (B, 2, T) when the model has one output
+                if arr.ndim == 4:
+                    arr = arr[:, min(_str_stem_idx, arr.shape[1] - 1)]
+                for bi, st_i in enumerate(kept):
+                    actual = min(chunk_n, n_samples - st_i, arr.shape[-1])
+                    w = fade[:actual]
+                    out[:, st_i:st_i + actual] += arr[bi, :, :actual] * w[None, :]
+                    wgt[st_i:st_i + actual]    += w
+                ci += len(batch_starts)
+                i  += len(batch_starts)
+                if running:
+                    app.after(0, lambda v=min(0.99, ci / max(1, n_chunks)):
+                              _set_strings_progress(v))
+
+        np.divide(out, np.maximum(wgt, 1e-8)[None, :], out=out)
+        with audio_lock:
+            state.strings_data = np.ascontiguousarray(out.T)
+            state.strings_sr   = sr_i
+            state.strings_is_quick = False
+        el = time.time() - t0
+        print(f"[Strings] Strings in {el:.1f}s "
+              f"({n_samples / sr_i / max(el, 1e-6):.1f}x realtime)")
+        if running:
+            app.after(0, _swap_to_strings)
+            app.after(0, _update_strings_button)
+    except Exception as e:
+        print(f"[Strings] Separation error: {e}")
+    finally:
+        _fg_leave()
+        _strings_separating = False
+        if running:
+            app.after(0, _clear_strings_progress)
+            app.after(0, _update_strings_button)
+
+
 def separate_inst(path, into=None, cancel=None, ui_progress=False):
     """Run BS-RoFormer Resurrection Inst on *path* in a background thread.
 
@@ -1951,9 +2467,7 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
                 progress_bar.pack_forget()
                 _clear_progress()
                 wave_canvas.pack(fill="both", expand=True)
-                for b in (bgv_import_btn, fv_import_btn, hl_import_btn,
-                          any_import_btn, any_plus_import_btn, any_plusplus_import_btn,
-                          *_atmos_import_btns()):
+                for b in _all_import_btns():
                     b.configure(state="normal")
                 _unlock_transport()
                 _playlist_refresh()
@@ -2168,6 +2682,7 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
 # Must be placed here — after load_inst_model() is defined.
 threading.Thread(target=load_inst_model, daemon=True).start()
 threading.Thread(target=load_kara_model, daemon=True).start()
+threading.Thread(target=load_strings_model, daemon=True).start()
 
 
 # ----------------------------
@@ -2298,6 +2813,12 @@ class AppState:
     atmos_br_sr:     Optional[int]    = None
     atmos_br_volume: float            = 1.0
     last_atmos_br_dir: Optional[str]  = None
+
+    # ── Bowed strings, from gilliaan's model ──────────────────────
+    strings_data:   Optional[object] = None
+    strings_is_quick: bool           = False
+    strings_sr:     Optional[int]    = None
+    strings_volume: float            = 1.0
 
     any_data:    Optional[object] = None
     any_sr:      Optional[int]    = None
@@ -3450,10 +3971,15 @@ def mix(start, frames):
 
     # Determine which stems are soloed so mute logic is correct.
     # A stem is audible when: not muted, AND (nothing is soloed OR it is soloed).
+    # Every cell that can be soloed, not only the separated stems. A cell
+    # missing from here can be soloed without silencing anything else, which
+    # looks exactly like solo being broken.
     any_solo = any(state.stem_solo.get(k, False)
                    for k in list(stems_now.keys()) +
                             ["front_vocals", "bg_vocals", "hidden_layer",
-                             "any", "any+", "any++", "atmos_fl", "atmos_fr", "atmos_c", "atmos_lfe", "atmos_bl", "atmos_br",
+                             "any", "any+", "any++", "strings",
+                             "atmos_fl", "atmos_fr", "atmos_c",
+                             "atmos_lfe", "atmos_bl", "atmos_br",
                              "instrumental"])
 
     def _audible(key):
@@ -3586,6 +4112,7 @@ def mix(start, frames):
     _mix_import(state.atmos_lfe_data, state.atmos_lfe_volume, "atmos_lfe")
     _mix_import(state.atmos_bl_data, state.atmos_bl_volume, "atmos_bl")
     _mix_import(state.atmos_br_data, state.atmos_br_volume, "atmos_br")
+    _mix_import(state.strings_data,  state.strings_volume,  "strings")
     _mix_import(state.any_data,      state.any_volume,      "any")
     _mix_import(state.any_plus_data,    state.any_plus_volume,    "any+")
     _mix_import(state.any_plusplus_data,         state.any_plusplus_volume,         "any++")
@@ -3684,12 +4211,8 @@ def load_file():
     # Track name, list marker and export tracking are set in _start_load.
     _clear_progress()
     # Disable BG Vocals import while separating
-    app.after(0, lambda: bgv_import_btn.configure(state="disabled"))
-    app.after(0, lambda: fv_import_btn.configure(state="disabled"))
-    app.after(0, lambda: hl_import_btn.configure(state="disabled"))
-    app.after(0, lambda: any_import_btn.configure(state="disabled"))
-    app.after(0, lambda: any_plus_import_btn.configure(state="disabled"))
-    app.after(0, lambda: any_plusplus_import_btn.configure(state="disabled"))
+    for _b in _all_import_btns():
+        app.after(0, lambda b=_b: b.configure(state="disabled"))
     # Hide waveform, show progress bar in the shared slot
     wave_canvas.pack_forget()
     progress_bar.pack(fill="x", padx=4, pady=(WAVE_H // 2 - 5))
@@ -3723,6 +4246,9 @@ def load_file():
                 separate_inst(path, cancel=cancel)
         if not cancel.is_set():
             separate_bg_vocals(cancel=cancel)
+        # Bowed strings, from gilliaan's model, into the STRINGS cell.
+        if _STR_AUTO and not cancel.is_set() and strings_model is not None:
+            separate_strings(path, cancel=cancel)
     _start_load(path, _load_job)
 
 
@@ -3786,6 +4312,9 @@ def load_file_path(path):
         # BG VOX comes from the karaoke model, not from a file.
         if not cancel.is_set():
             separate_bg_vocals(cancel=cancel)
+        # Bowed strings, from gilliaan's model, into the STRINGS cell.
+        if _STR_AUTO and not cancel.is_set() and strings_model is not None:
+            separate_strings(path, cancel=cancel)
 
     _start_load(path, _load_job_inner)
 
@@ -3920,6 +4449,11 @@ def _unload_track_extras():
     """
     state.fv_data        = None
     state.bg_vocals_data = None
+    state.strings_data   = None
+    state.strings_is_quick = False
+    if _other_muted_by_strings[0]:
+        state.stem_mute["other"] = False
+        _other_muted_by_strings[0] = False
     state.instrumental   = None
     _halves_muted_by_vocals.clear()
     state.instrumental_is_quick = False
@@ -4073,9 +4607,7 @@ def _apply_loaded_result(path, cached):
         progress_bar.pack_forget()
         _clear_progress()
         wave_canvas.pack(fill="both", expand=True)
-        for b in (bgv_import_btn, fv_import_btn, hl_import_btn,
-                  any_import_btn, any_plus_import_btn, any_plusplus_import_btn,
-                  *_atmos_import_btns()):
+        for b in _all_import_btns():
             b.configure(state="normal")
         _unlock_transport()
         _update_inst_status_label()
@@ -4152,8 +4684,7 @@ def separate(path, into=None, cancel=None):
         state.separating = False
         if running:
             app.after(0, _clear_progress)
-            for btn in (bgv_import_btn, fv_import_btn, hl_import_btn,
-                        any_import_btn, any_plus_import_btn, any_plusplus_import_btn):
+            for btn in _all_import_btns():
                 app.after(0, lambda b=btn: b.configure(state="normal"))
 
     if model is None:
@@ -4369,6 +4900,18 @@ def separate(path, into=None, cancel=None):
     # audio is in the stems the user corrected it to last time.
     _apply_saved_fixes()
 
+    # A stand-in for the STRINGS cell, until its own model has run.
+    if _STR_QUICK and state.strings_data is None:
+        _qs = _quick_strings(new_stems)
+        if _qs is not None:
+            with audio_lock:
+                state.strings_data = _qs
+                state.strings_sr   = _MODEL_SR
+                state.strings_is_quick = True
+            if running:
+                app.after(0, _swap_to_strings)
+                app.after(0, _update_strings_status_label)
+
     # The INSTRUM cell can be filled right now from the stems, so it's usable
     # while the dedicated model pass is still running (or instead of it, when
     # AUTO SEPARATE is off).
@@ -4392,12 +4935,7 @@ def separate(path, into=None, cancel=None):
             _clear_progress()
             wave_canvas.pack(fill="both", expand=True)
             bgv_import_btn.configure(state="normal")
-            fv_import_btn.configure(state="normal")
-            hl_import_btn.configure(state="normal")
-            any_import_btn.configure(state="normal")
-            any_plus_import_btn.configure(state="normal")
-            any_plusplus_import_btn.configure(state="normal")
-            for _b in _atmos_import_btns():
+            for _b in _all_import_btns():
                 _b.configure(state="normal")
             _unlock_transport()
             _playlist_refresh()
@@ -4637,6 +5175,7 @@ _EXPORT_EXTRAS = {
     "instrumental": ("instrumental",   "instrumental_vol"),
     "front_vocals": ("fv_data",        "fv_volume"),
     "bg_vocals":    ("bg_vocals_data", "bg_vocals_volume"),
+    "strings":      ("strings_data",   "strings_volume"),
 }
 
 
@@ -5314,6 +5853,21 @@ def _resample_audio(audio, file_sr):
 _ATMOS_KEYS = ("atmos_fl", "atmos_fr", "atmos_c", "atmos_lfe", "atmos_bl", "atmos_br")
 
 
+def _all_import_btns():
+    """Every import button that exists right now.
+
+    Cells come and go (ANY+ and ANY++ were removed), and their globals stay
+    behind as None. Enabling one of those raised inside the load-completion
+    block, which is why the transport never lit up after a separation.
+    """
+    names = ("bgv_import_btn", "fv_import_btn", "hl_import_btn",
+             "any_import_btn", "any_plus_import_btn",
+             "any_plusplus_import_btn")
+    out = [globals().get(n) for n in names]
+    out += _atmos_import_btns()
+    return [b for b in out if b is not None]
+
+
 def _atmos_import_btns():
     """The ATMOS import buttons that have been built so far."""
     out = []
@@ -5673,7 +6227,8 @@ def load_any_plus():
         state.any_plus_data = _resample_audio(audio, file_sr)
         state.any_plus_sr   = state.sr
         name_no_ext = os.path.splitext(os.path.basename(path))[0]
-        any_plus_import_btn.configure(text=f"⬡ {name_no_ext[:18]}")
+        if any_plus_import_btn is not None:      # cell no longer built
+            any_plus_import_btn.configure(text=f"⬡ {name_no_ext[:18]}")
     except Exception as e:
         print("Strings load error:", e)
 
@@ -5696,7 +6251,8 @@ def load_any_plusplus():
         state.any_plusplus_data = _resample_audio(audio, file_sr)
         state.any_plusplus_sr   = state.sr
         name_no_ext = os.path.splitext(os.path.basename(path))[0]
-        any_plusplus_import_btn.configure(text=f"⬡ {name_no_ext[:18]}")
+        if any_plusplus_import_btn is not None:
+            any_plusplus_import_btn.configure(text=f"⬡ {name_no_ext[:18]}")
     except Exception as e:
         print("FX load error:", e)
 
@@ -5976,10 +6532,12 @@ def _bounce_load(data: np.ndarray, key: str):
         any_import_btn.configure(text="⬡ BOUNCE")
     elif key == "any+":
         state.any_plus_data, state.any_plus_sr = data, sr_i
-        any_plus_import_btn.configure(text="⬡ BOUNCE")
+        if any_plus_import_btn is not None:
+            any_plus_import_btn.configure(text="⬡ BOUNCE")
     elif key == "any++":
         state.any_plusplus_data, state.any_plusplus_sr = data, sr_i
-        any_plusplus_import_btn.configure(text="⬡ BOUNCE")
+        if any_plusplus_import_btn is not None:
+            any_plusplus_import_btn.configure(text="⬡ BOUNCE")
 
 
 _eq_window = None   # singleton reference
@@ -6546,8 +7104,10 @@ _fix_list_frame = None
 _FIX_EXTRA_BUFFERS = {
     "front_vocals": ("fv_data", "fv_sr"),
     "bg_vocals":    ("bg_vocals_data", "bg_vocals_sr"),
+    "strings":      ("strings_data", "strings_sr"),
 }
-_FIX_DISPLAY = {"front_vocals": "FRT VOX", "bg_vocals": "BG VOX"}
+_FIX_DISPLAY = {"front_vocals": "FRT VOX", "bg_vocals": "BG VOX",
+                "strings": "STRINGS"}
 
 
 def _fix_label_for(key):
@@ -7638,6 +8198,8 @@ for col_idx, name in enumerate(STEMS):
         def _cmd():
             _toggle_mute(n)
             _inst_muted_by_us.discard(n)
+            if n == "other" and state.strings_data is not None:
+                _other_toggled()
             if n == "vocals":
                 if _split_halves_exist():
                     # The split halves are the alternative to this stem, so
@@ -7785,7 +8347,7 @@ for col_idx, name in enumerate(STEMS):
     tk.Frame(cell, bg=BG, height=6).pack()
 
 # FRT VOX — user-imported audio stem cell (column 6)
-fv_col = len(STEMS)
+fv_col = len(STEMS) + 1      # STRINGS sits at len(STEMS), just left of here
 mixer_grid.columnconfigure(fv_col, weight=1, minsize=MIXER_MIN_CELL_W)
 
 fv_cell = ctk.CTkFrame(mixer_grid,
@@ -7965,7 +8527,7 @@ _make_dynamics_group(fv_cell, "front_vocals")
 tk.Frame(fv_cell, bg=BG, height=6).pack()
 
 # BG VOX — user-imported audio stem cell (column 7)
-bgv_col = len(STEMS) + 1
+bgv_col = len(STEMS) + 2
 mixer_grid.columnconfigure(bgv_col, weight=1, minsize=MIXER_MIN_CELL_W)
 
 bgv_cell = ctk.CTkFrame(mixer_grid,
@@ -8180,7 +8742,7 @@ _make_dynamics_group(bgv_cell, "bg_vocals")
 tk.Frame(bgv_cell, bg=BG, height=6).pack()
 
 # HIDDEN LAYER — user-imported audio stem cell (column 8)
-hl_col = len(STEMS) + 2
+hl_col = len(STEMS) + 3
 # HID LAYER retired: constructed into a frame that is never shown, so the
 # widgets the rest of the file refers to still exist while nothing appears in
 # the mixer. Its grid column is deliberately left unconfigured so it takes no
@@ -8445,15 +9007,18 @@ def _make_import_cell(col_idx, label, key, vol_global, load_fn,
                                 font=("Courier New", 13, "bold"),
                                 corner_radius=0, border_width=1,
                                 border_color=BORDER, height=20)
-    import_btn.pack(side="left", fill="x", expand=True)
     globals()[import_btn_var_name] = import_btn
 
+    # The clear button is packed first, against the right edge, so the
+    # import button expands into what is left. Packed the other way round
+    # the expanding button takes everything and squeezes this to a sliver.
     ctk.CTkButton(_imp_row, text="✕",
                   command=lambda k=key, b=import_btn: _clear_import(k, b),
                   fg_color=STEEL, hover_color=MUTE_ON, text_color=TEXT_DIM,
                   font=("Courier New", 12, "bold"),
                   corner_radius=0, border_width=1, border_color=BORDER,
-                  height=20, width=22).pack(side="left", padx=(2, 0))
+                  height=20, width=26).pack(side="right", padx=(2, 0))
+    import_btn.pack(side="left", fill="x", expand=True)
 
     vol_sl = LockedSlider(cell, from_=0, to=2,
                            button_color=RED, button_hover_color=GLOW_RED,
@@ -8502,17 +9067,263 @@ def _make_import_cell(col_idx, label, key, vol_global, load_fn,
     return cell
 
 
-any_col   = len(STEMS) + 3
-any_plus_col = len(STEMS) + 4
-any_plusplus_col      = len(STEMS) + 5
+any_col   = len(STEMS) + 4
+any_plus_col = len(STEMS) + 5          # kept: the removed ANY+ cell's column
+any_plusplus_col      = len(STEMS) + 6 # kept: the removed ANY++ cell's column
 
 any_import_btn   = None   # filled by _make_import_cell
 any_plus_import_btn = None
 any_plusplus_import_btn      = None
 
 _make_import_cell(any_col,   "ANY",     "any",   "any_volume",   load_any,   "any_import_btn")
-_make_import_cell(any_plus_col, "ANY+",    "any+", "any_plus_volume", load_any_plus, "any_plus_import_btn")
-_make_import_cell(any_plusplus_col,      "ANY++",   "any++",      "any_plusplus_volume",      load_any_plusplus,      "any_plusplus_import_btn")
+# ANY+ and ANY++ have been replaced by the STRINGS cell below. Their loaders
+# and state stay, so an old session mentioning them still loads.
+
+# ── STRINGS — gilliaan's bowed strings model ───────────────────────────────
+# Laid out like the FRT VOX and BG VOX cells, with the INST cell's AUTO
+# SEPARATE switch and SEPARATE NOW button. Nothing is imported here: the
+# cell is filled by the model, so it has no IMPORT or clear button.
+# Immediately right of OTHER and left of FRT VOX.
+strings_col = len(STEMS)
+mixer_grid.columnconfigure(strings_col, weight=1, minsize=MIXER_MIN_CELL_W)
+
+_strings_cell = ctk.CTkFrame(mixer_grid, fg_color=BG, corner_radius=0,
+                             border_color=STEEL, border_width=1)
+_strings_cell.grid(row=0, column=strings_col, padx=4, pady=4, sticky="nsew")
+
+tk.Frame(_strings_cell, bg=RED, height=3).pack(fill="x")
+
+_strings_hdr = ctk.CTkFrame(_strings_cell, fg_color="transparent")
+_strings_hdr.pack(fill="x", padx=2, pady=(2, 0))
+_strings_name_lbl = ctk.CTkLabel(_strings_hdr, text="STRINGS", anchor="center",
+                                 width=1, font=FONT_LABEL,
+                                 text_color=BRIGHT_RED)
+
+
+def _strings_mute():
+    _toggle_mute("strings")
+    _strings_toggled()
+
+
+def _strings_solo():
+    state.stem_solo["strings"] = not state.stem_solo.get("strings", False)
+    _paint_ms("strings")
+
+
+_strings_mb = ctk.CTkButton(_strings_hdr, text="M", command=_strings_mute,
+                            fg_color=STEEL, hover_color=MUTE_ON,
+                            text_color=TEXT_MAIN, font=FONT_MS_BTN,
+                            corner_radius=0, border_width=1,
+                            border_color=BORDER, height=MS_BTN_H, width=MS_BTN_W)
+_strings_mb.pack(side="right", padx=(1, 2), pady=(6, 0))
+_strings_sb = ctk.CTkButton(_strings_hdr, text="S", command=_strings_solo,
+                            fg_color=STEEL, hover_color=SOLO_ON,
+                            text_color=TEXT_MAIN, font=FONT_MS_BTN,
+                            corner_radius=0, border_width=1,
+                            border_color=BORDER, height=MS_BTN_H, width=MS_BTN_W)
+_strings_sb.pack(side="right", padx=(0, 1), pady=(6, 0))
+_strings_name_lbl.pack(side="left", fill="x", expand=True)
+_mute_btns["strings"] = _strings_mb
+_solo_btns["strings"] = _strings_sb
+
+# The model's name and author, directly under the cell's own name.
+ctk.CTkLabel(_strings_cell, text=_STR_TITLE,
+             font=("Courier New", 11), text_color=STEEL_LIGHT,
+             wraplength=140, justify="center").pack(pady=(2, 0), fill="x")
+_str_credit_row = ctk.CTkFrame(_strings_cell, fg_color="transparent")
+_str_credit_row.pack()
+_sby, _, _swho = _STR_CREDIT.partition(" ")
+ctk.CTkLabel(_str_credit_row, text=_sby + " ",
+             font=("Courier New", 11), text_color=TEXT_DIM).pack(side="left")
+ctk.CTkLabel(_str_credit_row, text=_swho or _STR_CREDIT,
+             font=("Courier New", 13, "bold"),
+             text_color=BRIGHT_GREEN).pack(side="left")
+
+# What the model is doing, worded as on the INST cell.
+_strings_status_lbl = ctk.CTkLabel(_strings_cell, text="WAITING",
+                                   font=("Courier New", 10, "bold"),
+                                   text_color=TEXT_DIM)
+_strings_status_lbl.pack(pady=(2, 0))
+
+
+def _update_strings_status_label():
+    lbl = globals().get("_strings_status_lbl")
+    if lbl is None:
+        return
+    try:
+        if _strings_separating:
+            lbl.configure(text="SEPARATING…", text_color="#ffaa00")
+        elif state.strings_data is not None:
+            if getattr(state, "strings_is_quick", False):
+                lbl.configure(text="QUICK MIX", text_color="#ffaa00")
+            else:
+                lbl.configure(text="READY", text_color=BRIGHT_GREEN)
+        elif not _str_find_files()[0]:
+            lbl.configure(text="NO MODEL", text_color=TEXT_DIM)
+        elif not _STR_AUTO:
+            lbl.configure(text="AUTO OFF", text_color=TEXT_DIM)
+        else:
+            lbl.configure(text="WAITING", text_color=TEXT_DIM)
+    except Exception:
+        pass
+
+
+def _update_strings_button():
+    """Kept under its old name: the separation code calls this when it ends."""
+    _update_strings_status_label()
+
+
+# Progress for this cell's pass, shown only while it runs.
+_strings_prog_row = ctk.CTkFrame(_strings_cell, fg_color="transparent")
+_strings_prog_bar = ctk.CTkProgressBar(_strings_prog_row, progress_color=GLOW_RED,
+                                       fg_color=PANEL, corner_radius=0, height=6)
+_strings_prog_bar.set(0)
+_strings_prog_bar.pack(fill="x", padx=2)
+_strings_prog_lbl = ctk.CTkLabel(_strings_prog_row, text="0%",
+                                 font=("Courier New", 16, "bold"),
+                                 text_color=GLOW_RED)
+_strings_prog_lbl.pack()
+
+
+def _set_strings_progress(frac):
+    try:
+        if not _strings_prog_row.winfo_ismapped():
+            _strings_prog_row.pack(fill="x", padx=6, pady=(2, 0),
+                                   after=_strings_status_lbl)
+        _strings_prog_bar.set(max(0.0, min(1.0, frac)))
+        _strings_prog_lbl.configure(text=f"{int(round(frac * 100))}%")
+    except Exception:
+        pass
+
+
+def _clear_strings_progress():
+    try:
+        _strings_prog_bar.set(0)
+        _strings_prog_lbl.configure(text="0%")
+        _strings_prog_row.pack_forget()
+    except Exception:
+        pass
+
+
+_strings_vol_sl = LockedSlider(_strings_cell, from_=0, to=2,
+                          button_color=RED,
+                          button_hover_color=GLOW_RED,
+                          progress_color=RED,
+                          command=lambda v: setattr(state, "strings_volume", float(v)))
+_strings_vol_sl.set(1.0)
+_strings_vol_sl.pack(fill="x", padx=6, pady=(0, 1))
+
+# Pan
+_strings_pan_row = ctk.CTkFrame(_strings_cell, fg_color="transparent")
+_strings_pan_row.pack(fill="x", padx=4, pady=0)
+ctk.CTkLabel(_strings_pan_row, text="PAN", font=("Courier New", 13, "bold"),
+             text_color=TEXT_DIM, width=22).pack(side="left")
+_strings_pan_sl = LockedSlider(_strings_pan_row, from_=-1.0, to=1.0, height=12,
+                           button_color=STEEL, button_hover_color=STEEL_LIGHT,
+                           progress_color=STEEL,
+                           command=lambda v: state.stem_pan.__setitem__("strings", float(v)))
+_strings_pan_sl.set(0.0)
+_strings_pan_sl.pack(side="left", fill="x", expand=True)
+
+# Stereo Width slider
+_strings_sw_row = ctk.CTkFrame(_strings_cell, fg_color="transparent")
+_strings_sw_row.pack(fill="x", padx=4, pady=0)
+ctk.CTkLabel(_strings_sw_row, text="SW",
+             font=("Courier New", 13, "bold"),
+             text_color=TEXT_DIM, width=22).pack(side="left")
+_strings_sw_sl = LockedSlider(_strings_sw_row, from_=0.0, to=2.0, height=12,
+                          button_color=STEEL, button_hover_color=STEEL_LIGHT,
+                          progress_color=STEEL,
+                          command=lambda v: state.stem_widths.__setitem__("strings", float(v)))
+_strings_sw_sl.set(1.0)
+_strings_sw_sl.pack(side="left", fill="x", expand=True)
+
+# Reverb
+_strings_rev_row = ctk.CTkFrame(_strings_cell, fg_color="transparent")
+_strings_rev_row.pack(fill="x", padx=4, pady=0)
+ctk.CTkLabel(_strings_rev_row, text="REV", font=("Courier New", 13, "bold"),
+             text_color=TEXT_DIM, width=22).pack(side="left")
+LockedSlider(_strings_rev_row, from_=0.0, to=1.0, height=12,
+             button_color=STEEL, button_hover_color=STEEL_LIGHT, progress_color=STEEL,
+             command=lambda v: state.stem_reverbs.__setitem__("strings", float(v))
+             ).pack(side="left", fill="x", expand=True)
+
+# Air
+_strings_air_row = ctk.CTkFrame(_strings_cell, fg_color="transparent")
+_strings_air_row.pack(fill="x", padx=4, pady=0)
+ctk.CTkLabel(_strings_air_row, text="AIR", font=("Courier New", 13, "bold"),
+             text_color=TEXT_DIM, width=22).pack(side="left")
+_strings_air_sl = LockedSlider(_strings_air_row, from_=-1.0, to=1.0, height=12,
+                           button_color=STEEL, button_hover_color=STEEL_LIGHT, progress_color=STEEL,
+                           command=lambda v: state.stem_air.__setitem__("strings", float(v)))
+_strings_air_sl.set(0.0)
+_strings_air_sl.pack(side="left", fill="x", expand=True)
+
+# NDG (nudge) sliders removed. state.stem_nudge stays empty, so the
+# mixer treats every stem as un-nudged.
+# RST button
+def _reset_strings():
+    _strings_vol_sl.set(1.0)
+    setattr(state, "strings_volume", 1.0)
+
+_strings_rst_row = ctk.CTkFrame(_strings_cell, fg_color="transparent")
+_strings_rst_row.pack(pady=(0, 2))
+ctk.CTkButton(_strings_rst_row,
+              text="RST",
+              command=_reset_strings,
+              fg_color=STEEL,
+              hover_color=STEEL_LIGHT,
+              text_color=TEXT_DIM,
+              font=("Courier New", 13, "bold"),
+              corner_radius=0,
+              border_width=1,
+              border_color=BORDER,
+              height=18,
+              width=36
+              ).pack(side="left", padx=(0, 4))
+make_meter(_strings_rst_row, "strings").pack(side="left")
+# COMP / LEVELLER / LIMITER, folded behind one header like the main cells
+_make_dynamics_group(_strings_cell, "strings")
+
+# The model's own controls sit under the dynamics button, at the foot of the
+# cell.
+# AUTO SEPARATE — run after every track, as the INST cell does.
+_strings_auto_var = ctk.BooleanVar(value=_STR_AUTO)
+
+
+def _on_strings_auto():
+    global _STR_AUTO
+    _STR_AUTO = _strings_auto_var.get()
+    _update_strings_status_label()
+
+
+ctk.CTkCheckBox(_strings_cell, text="AUTO SEPARATE",
+                variable=_strings_auto_var, command=_on_strings_auto,
+                font=("Courier New", 11), text_color=TEXT_MAIN,
+                fg_color=RED, hover_color=BRIGHT_RED,
+                checkmark_color="#ffffff", corner_radius=0,
+                border_color=STEEL, checkbox_width=14, checkbox_height=14
+                ).pack(padx=6, pady=(2, 0))
+
+
+def _strings_separate_now():
+    path = _playlist_current[0]
+    if not path or state.separating or _strings_separating:
+        return
+    threading.Thread(target=_run_low_priority,
+                     args=(separate_strings, path), daemon=True).start()
+    _update_strings_status_label()
+
+
+ctk.CTkButton(_strings_cell, text="⟳ SEPARATE NOW", command=_strings_separate_now,
+              fg_color=STEEL, hover_color=STEEL_LIGHT, text_color=BRIGHT_GREEN,
+              font=("Courier New", 12, "bold"), corner_radius=0,
+              border_width=1, border_color=BORDER, height=20
+              ).pack(fill="x", padx=6, pady=(3, 2))
+
+tk.Frame(_strings_cell, bg=BG, height=4).pack()
+
+_update_strings_status_label()
 
 # ── ATMOS bed cells ────────────────────────────────────────────────────────
 # Six import slots for the channels of an Atmos 5.1 bed, on their own row
@@ -8590,7 +9401,7 @@ def _vocals_autosolo_check():
 # (see _vocals_autosolo_check).
 state.stem_mute["instrumental"] = True
 
-inst_col = len(STEMS) + 6
+inst_col = len(STEMS) + 7
 mixer_grid.columnconfigure(inst_col, weight=1, minsize=MIXER_MIN_CELL_W)
 
 _inst_cell = ctk.CTkFrame(mixer_grid, fg_color=BG, corner_radius=0,
@@ -8935,9 +9746,11 @@ ctk.CTkCheckBox(check_row,
                 border_color=STEEL
                 ).pack(side="left", padx=8)
 
-# The two karaoke halves, same as the instrumental: their audio lives outside
-# state.stems, but export_selected_stems() knows where to find it.
-for _xkey, _xlabel in (("front_vocals", "FRT VOX"), ("bg_vocals", "BG VOX")):
+# The karaoke halves and the strings cell, same as the instrumental: their
+# audio lives outside state.stems, but export_selected_stems() knows where to
+# find it (see _EXPORT_EXTRAS).
+for _xkey, _xlabel in (("front_vocals", "FRT VOX"), ("bg_vocals", "BG VOX"),
+                       ("strings", "STRINGS")):
     _xvar = ctk.BooleanVar(value=False)
     stem_check_vars[_xkey] = _xvar
     ctk.CTkCheckBox(check_row,
@@ -10047,6 +10860,12 @@ _make_collapsible(_rammstein_panel, _rammstein_title_lbl,
 _splash_set(0.35, "UI BUILT — LOADING MODEL…")
 app.after(200, _poll_model_ready)
 _load_stem_fixes()          # fixes saved from previous sessions
+
+# Look for a newer ramma.py on GitHub, in the background so a slow or
+# unreachable network never delays start-up.
+if _UPDATE_CHECK and _UPDATE_REPO:
+    threading.Thread(target=lambda: check_for_update(quiet=True),
+                     daemon=True).start()
 app.after(1200, _fix_watch_loop)
 
 app.after(800, _fit_loop)   # keep every label and button inside its space
