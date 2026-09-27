@@ -5,7 +5,7 @@ I take no credit for creating the program, but I am in the credits. <.< <br>
 All credits go to the kind people helping me that are in the intro splash screen of the program.<br>
 -<br>
 I'm sorry if things are very basic, this is the first time I try to do stuff on github.<br>
-It is the first time I try making a program. Sorry if it runs half-bad.<br>
+It is the first time I try making a program.<br>
 The models linked in the models folder that you will need to download (unless they automatically download) were made by: UNWA, GILLIAAN, BECRUILY, & JARREDOU<br>
 Miss you JARREDOU...<br>
 -<br>
