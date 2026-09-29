@@ -1371,7 +1371,21 @@ def install_update(new_hash, text):
     return True
 
 
-def check_for_update(quiet=True):
+def _update_notice(kind, title, text):
+    """A dialog on the UI thread, for a check the user asked for."""
+    if not running:
+        return
+    def _show():
+        try:
+            {"info": messagebox.showinfo,
+             "warn": messagebox.showwarning,
+             "error": messagebox.showerror}[kind](title, text)
+        except Exception:
+            pass
+    app.after(0, _show)
+
+
+def check_for_update(quiet=True, manual=False):
     """Compare every tracked file with the repository and offer the update.
 
     Contents are compared rather than commit ids: it needs only
@@ -1382,6 +1396,11 @@ def check_for_update(quiet=True):
     if not _UPDATE_REPO:
         if not quiet:
             print("[Update] No repository set (_UPDATE_REPO near the top).")
+        if manual:
+            _update_notice("warn", "RAMMA — updates are off",
+                           "No GitHub repository is set.\n\nPut yours in "
+                           "_UPDATE_REPO near the top of ramma.py, e.g.\n"
+                           "    _UPDATE_REPO = \"yourname/ramma\"")
         return None
 
     changed, missing = [], []
@@ -1393,6 +1412,11 @@ def check_for_update(quiet=True):
                 missing.append(repo_path)
             else:
                 print(f"[Update] Could not reach GitHub: {e}")
+                if manual:
+                    _update_notice("error", "RAMMA — could not check",
+                                   f"GitHub could not be reached:\n\n{e}\n\n"
+                                   f"Check your internet connection and try "
+                                   f"again.")
                 return None
             continue
         try:
@@ -1412,13 +1436,26 @@ def check_for_update(quiet=True):
               f"Check the repo name, branch and file paths, and that the "
               f"repository is public — private ones cannot be read without "
               f"signing in.")
+    if missing and manual and not changed:
+        _update_notice("error", "RAMMA — could not check",
+                       "GitHub has no file at:\n  " +
+                       "\n  ".join(f"{_UPDATE_REPO}/{_UPDATE_BRANCH}/{m}"
+                                    for m in missing) +
+                       "\n\nCheck the repository name, branch and file "
+                       "paths, and that the repository is public.")
+        return None
     if not changed:
         if not missing and not quiet:
             print("[Update] Already up to date.")
+        if manual:
+            _update_notice("info", "RAMMA — up to date",
+                           "You have the latest version.")
         return False
 
     combined = _bytes_hash(b"".join(d for _rp, _l, d in changed))
-    if _update_state().get("skipped") == combined:
+    # A check you asked for always offers the update, even one you declined
+    # at start-up before.
+    if not manual and _update_state().get("skipped") == combined:
         if not quiet:
             print("[Update] A newer version is available but was skipped.")
         return False
@@ -2915,6 +2952,14 @@ def separate_bg_vocals(into=None, cancel=None):
                         batch_n = max(1, batch_n // 2)
                         print(f"[Karaoke] {e}\n[Karaoke] Retrying with batch {batch_n}")
                         continue
+                    if _is_oom(e) and run_device.type == "cuda":
+                        # Full precision would need twice the memory; finish
+                        # this track on the CPU instead.
+                        run_device = torch.device("cpu")
+                        kara_model.to(run_device)
+                        use_fp16 = False
+                        print("[Karaoke] Out of GPU memory even one chunk at a time — finishing this track on the CPU")
+                        continue
                     if use_fp16:
                         use_fp16 = False
                         print(f"[Karaoke] {e}\n[Karaoke] Retrying in full precision")
@@ -2935,6 +2980,8 @@ def separate_bg_vocals(into=None, cancel=None):
                 _split_upd(min(0.99, ci / max(1, n_chunks)))
 
         wgt = np.maximum(wgt, 1e-8)
+        if run_device.type != device.type:
+            kara_model.to(device)
         out_back /= wgt[:, None]
         out_lead /= wgt[:, None]
         have_lead = bool(np.any(out_lead))
@@ -3280,6 +3327,14 @@ def refine_vocals(path, cancel=None):
                         batch_n = max(1, batch_n // 2)
                         print(f"[Vocals] {e}\n[Vocals] Retrying with batch {batch_n}")
                         continue
+                    if _is_oom(e) and run_device.type == "cuda":
+                        # Full precision would need twice the memory; finish
+                        # this track on the CPU instead.
+                        run_device = torch.device("cpu")
+                        vocals_model.to(run_device)
+                        use_fp16 = False
+                        print("[Vocals] Out of GPU memory even one chunk at a time — finishing this track on the CPU")
+                        continue
                     if use_fp16:
                         use_fp16 = False
                         print(f"[Vocals] {e}\n[Vocals] Retrying in full precision")
@@ -3300,6 +3355,8 @@ def refine_vocals(path, cancel=None):
                               _set_vocals_progress(v))
 
         np.divide(out, np.maximum(wgt, 1e-8)[None, :], out=out)
+        if run_device.type != device.type:
+            vocals_model.to(device)
         refined = np.ascontiguousarray(out.T)
         with audio_lock:
             if state.stems:
@@ -3399,6 +3456,14 @@ def separate_strings(path=None, cancel=None):
                         batch_n = max(1, batch_n // 2)
                         print(f"[Strings] {e}\n[Strings] Retrying with batch {batch_n}")
                         continue
+                    if _is_oom(e) and run_device.type == "cuda":
+                        # Full precision would need twice the memory; finish
+                        # this track on the CPU instead.
+                        run_device = torch.device("cpu")
+                        strings_model.to(run_device)
+                        use_fp16 = False
+                        print("[Strings] Out of GPU memory even one chunk at a time — finishing this track on the CPU")
+                        continue
                     if use_fp16:
                         use_fp16 = False
                         print(f"[Strings] {e}\n[Strings] Retrying in full precision")
@@ -3420,6 +3485,8 @@ def separate_strings(path=None, cancel=None):
                               _set_strings_progress(v))
 
         np.divide(out, np.maximum(wgt, 1e-8)[None, :], out=out)
+        if run_device.type != device.type:
+            strings_model.to(device)
         strings = np.ascontiguousarray(out.T)
         with audio_lock:
             state.strings_data = strings
@@ -3615,6 +3682,15 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
                         batch_n = max(1, batch_n // 2)
                         print(f"[Inst] {e}\n[Inst] Retrying with batch size {batch_n}")
                         continue
+                    if _is_oom(e) and run_device.type == "cuda":
+                        # Full precision would need twice the memory. Move to
+                        # the CPU for the rest: slower, but it finishes.
+                        run_device = torch.device("cpu")
+                        inst_model.to(run_device)
+                        use_fp16 = False
+                        print("[Inst] Out of GPU memory even one chunk at a time "
+                              "— finishing this track on the CPU")
+                        continue
                     if use_fp16:
                         use_fp16 = False
                         print(f"[Inst] {e}\n[Inst] Retrying in full precision")
@@ -3638,6 +3714,8 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
 
         wgt = np.maximum(wgt, 1e-8)
         out_inst /= wgt[:, None]
+        if run_device.type != device.type:
+            inst_model.to(device)       # ready on the GPU for the next track
 
         # 3. Back to the app's playback rate if the model used another one
         if sr_i != 44100:
@@ -3692,6 +3770,13 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
     finally:
         if not bg:
             _fg_leave()
+            # Always take the cell's progress bar down. It used to be
+            # cleared only on success (or in INSTRUMENTAL-ONLY mode), so an
+            # error part-way through left it frozen at whatever it last
+            # showed — which looked exactly like the pass hanging.
+            if running:
+                app.after(0, _clear_inst_progress)
+                app.after(0, _update_inst_status_label)
             _inst_separating = False
             if running:
                 app.after(0, _clear_inst_progress)
@@ -5452,6 +5537,12 @@ def _pass_release():
         _pass_lock.release()
     except RuntimeError:
         pass          # never acquired on this path
+
+
+def _is_oom(err):
+    """True for a GPU out-of-memory error."""
+    text = str(err).lower()
+    return "out of memory" in text or "cuda error: out of memory" in text
 
 
 def _fg_enter(tag="pass"):
@@ -7889,6 +7980,34 @@ ctk.CTkLabel(header,
              text="BS-RoFormer SW · 6-stem",
              font=FONT_SMALL,
              text_color=TEXT_DIM).pack(side="right", padx=20)
+
+
+def _on_update_click():
+    """Check GitHub now, off the UI thread, and say what was found."""
+    btn = _update_btn
+    try:
+        btn.configure(text="CHECKING…", state="disabled")
+    except Exception:
+        pass
+
+    def _work():
+        try:
+            check_for_update(quiet=False, manual=True)
+        finally:
+            if running:
+                app.after(0, lambda: btn.configure(text="⟳ UPDATE",
+                                                   state="normal"))
+
+    threading.Thread(target=_work, daemon=True).start()
+
+
+_update_btn = ctk.CTkButton(header, text="⟳ UPDATE", command=_on_update_click,
+                            fg_color=STEEL, hover_color=STEEL_LIGHT,
+                            text_color="#e6c000",
+                            font=("Courier New", 12, "bold"),
+                            corner_radius=0, border_width=1,
+                            border_color=BORDER, height=26, width=110)
+_update_btn.pack(side="right", padx=(0, 8))
 
 # ============================================================
 # SCROLLABLE CONTENT AREA — hosts everything below the header
