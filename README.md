@@ -48,3 +48,5 @@ I got permission from gabox to use their karaoke model, so it is included in the
 I got permission from gilliaan to use their bowed strings model, so it is included in the models.json file.
 
 Big thanks to megy for coming up with ideas.
+
+A way to circumvent the volume increase that happens when both Other and Strings are played have been implemented.
