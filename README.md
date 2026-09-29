@@ -14,10 +14,10 @@ The models linked in the models folder that will automatically download upon fir
 
 Miss you JARREDOU...
 
-# INSTALLATION:
+# INSTALLATION
 Read the "IMPORTANT! READ FIRST!" text file.
 
-# MODEL INSTALLATION:
+# MODEL INSTALLATION
 The models will download automatically upon first run.
 -
 2026-09-27
@@ -30,8 +30,10 @@ I might add a different way to circumvent the volume increase that happens when 
 -
 # RAMMA v0.667.1 is released!
 
-What's new:
-Auto-updater: RAMMA will, at the next update, automatically update upon launch when it is being released!
+What's new
+Auto-updater 
+
+RAMMA will, at the next update, automatically update upon launch when it is being released!
 
 Model selector for FRT VOX and BG VOX.
 
