@@ -33,6 +33,7 @@ I might add a different way to circumvent the volume increase that happens when 
 # RAMMA v0.667.1 is released!
 
 What's new
+
 Auto-updater 
 
 RAMMA will, at the next update, automatically update upon launch when it is being released!
