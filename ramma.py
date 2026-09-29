@@ -1452,14 +1452,8 @@ def check_for_update(quiet=True, manual=False):
                            "You have the latest version.")
         return False
 
-    combined = _bytes_hash(b"".join(d for _rp, _l, d in changed))
-    # A check you asked for always offers the update, even one you declined
-    # at start-up before.
-    if not manual and _update_state().get("skipped") == combined:
-        if not quiet:
-            print("[Update] A newer version is available but was skipped.")
-        return False
-
+    # Declining an update is not remembered: every start-up asks again
+    # while a newer version is waiting, so it cannot be missed for good.
     names = [rp for rp, _l, _d in changed]
     date, message = _github_commit_info()
     print(f"[Update] {len(changed)} file(s) differ from GitHub: "
@@ -1491,9 +1485,8 @@ def check_for_update(quiet=True, manual=False):
                           "as .bak."):
                     threading.Thread(target=_proceed, daemon=True).start()
                 else:
-                    st = _update_state()
-                    st["skipped"] = combined
-                    _save_update_state(st)
+                    print("[Update] Not installed — you will be asked again "
+                          "next time RAMMA starts.")
             except Exception:
                 pass
         app.after(0, _ask)
