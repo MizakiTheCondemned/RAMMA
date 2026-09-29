@@ -12,6 +12,7 @@ import os
 import json
 import sys
 import types
+import re
 from scipy.signal import sosfilt, sosfilt_zi, butter, iirpeak, iirnotch, resample_poly
 
 # ----------------------------
@@ -62,6 +63,71 @@ if not _librosa_ok:
     print("[RAMMA] librosa/numba unavailable — using built-in mel filterbank "
           "(fine for BS-RoFormer models; Mel-Band models such as the karaoke "
           "one need the real librosa: pip install librosa)")
+
+def _load_state_forgiving(m, sd, label="model"):
+    """Load weights, tolerating harmless differences.
+
+    A checkpoint and its config often disagree in small ways — a key renamed
+    between versions of the architecture, an extra buffer, a head the config
+    does not mention. Those load fine with strict=False and the model works.
+    Only a wholesale mismatch means the two files do not belong together, so
+    that is the only case reported as incompatible.
+    """
+    try:
+        m.load_state_dict(sd)
+        return "exact"
+    except Exception as strict_err:
+        own = m.state_dict()
+        usable = {k: v for k, v in sd.items()
+                  if k in own and tuple(own[k].shape) == tuple(v.shape)}
+        total = max(1, len(own))
+        share = len(usable) / total
+        if share < 0.5:
+            raise RuntimeError(
+                f"{label}: only {len(usable)} of {total} weights "
+                f"({share * 100:.0f}%) fit this config — the .ckpt and .yaml "
+                f"do not describe the same model.\n{strict_err}")
+        missing = total - len(usable)
+        m.load_state_dict(usable, strict=False)
+        print(f"[Models] {label}: loaded {len(usable)} of {total} weights "
+              f"({share * 100:.0f}%); {missing} left at their initial values. "
+              f"The config and checkpoint differ slightly but are close "
+              f"enough to run.")
+        return "partial"
+
+
+def _ensure_librosa():
+    """Try the real librosa again, now, and drop our stand-in if it works.
+
+    The probe above runs once while the program starts. If librosa was slow
+    to import, or numba was warming up, or anything else went wrong that
+    moment, the stand-in was installed for the rest of the session and every
+    Mel-Band model was refused even though librosa is installed. This is
+    asked again whenever a model actually needs it.
+    """
+    global _librosa_ok
+    if _librosa_ok:
+        return True
+    shim = sys.modules.get("librosa")
+    # Our stand-in is a bare ModuleType with no __file__; a real install has one.
+    if shim is not None and getattr(shim, "__file__", None) is None:
+        sys.modules.pop("librosa", None)
+        sys.modules.pop("librosa.filters", None)
+    try:
+        import librosa as _probe
+        _probe.filters.mel
+        _librosa_ok = True
+        print("[RAMMA] librosa found — Mel-Band models can use it")
+        return True
+    except Exception as e:
+        # Put the stand-in back so imports inside the model code still work.
+        if shim is not None:
+            sys.modules["librosa"] = shim
+            sys.modules["librosa.filters"] = getattr(shim, "filters", None)
+        print(f"[RAMMA] librosa still unavailable ({e}) — falling back to the "
+              f"built-in mel filterbank, which usually works")
+        return False
+
 
 # BS-RoFormer-SW via bs-roformer-infer (openmirlab)
 # Install: pip install bs-roformer-infer
@@ -262,7 +328,7 @@ _sp_bar_fill = tk.Frame(_sp_bar_bg, bg=RED)
 _sp_bar_fill.place(x=1, y=1, width=0, height=12)
 
 # Animated byline — cycles red → purple → gold
-_sp_byline = tk.Label(_sp_inner, text="Program made by: Sai & Eidii with help from megy, Denchik Games, Maggot, deton24, Dudumil and trexmus - Models by: becruily, jarredou, gilliaan & unwa",
+_sp_byline = tk.Label(_sp_inner, text="Program made by: Sai & Eidii with help from megy, Denchik Games, Maggot, deton24 and trexmus - Models by: becruily, jarredou & unwa",
                        font=("Courier New", 11, "bold"),
                        fg=GLOW_RED, bg=BG)
 # Long credits: prefer wrapping onto a second line over shrinking the type
@@ -710,6 +776,417 @@ def _import_bs_roformer():
         return _bsr_import_cache
 
 # ============================================================
+# MODEL PICKER
+# Finds the .ckpt files in the models folder, pairs each with its .yaml, and
+# lets a cell choose which one it uses. Adding a model is therefore a matter
+# of dropping the two files in the folder — nothing here needs editing.
+# ============================================================
+# Filename fragments that say who trained a model, so a cell can credit them.
+_MODEL_AUTHORS = [
+    ("becruily",     "becruily"),
+    ("gabox",        "gabox"),
+    ("aufr33",       "aufr33"),
+    ("unwa",         "unwa"),
+    ("gilliaan",     "gilliaan"),
+    ("jarredou",     "jarredou"),
+    ("viperx",       "ViperX"),
+    ("kimberley",    "Kim"),
+    ("mesk",         "MESK"),
+    ("sucial",       "Sucial"),
+    ("zfturbo",      "ZFTurbo"),
+]
+
+# Models whose filename carries no author, matched on the model's own name.
+# "BS-Roformer-Resurrection-Inst.ckpt" says nothing about unwa, and the
+# bowed-strings checkpoint nothing about gilliaan, so they are named here.
+_MODEL_NAME_AUTHORS = [
+    ("resurrection",  "unwa"),
+    ("bowed",         "gilliaan"),
+    ("string",        "gilliaan"),
+    ("sw-fixed",      "jarredou"),
+    ("sw_fixed",      "jarredou"),
+    ("bs-rofo-sw",    "jarredou"),
+]
+
+# Which files belong to which cell. A name matching any fragment counts.
+_MODEL_ROLES = {
+    "karaoke":      ("karaoke", "kara", "lead_back", "leadback"),
+    "instrumental": ("inst", "resurrection"),
+    "strings":      ("bowed", "string", "violin", "cello"),
+    "vocals":       ("vocals", "voc"),
+    "main":         ("sw-fixed", "sw_fixed", "bs-rofo-sw", "6stem", "six"),
+}
+
+
+def _model_author(name):
+    """Who trained this model, from its filename, or an empty string.
+
+    Most community checkpoints carry the author's name; the ones that do not
+    are matched on the model's own name instead.
+    """
+    low = os.path.basename(name).lower()
+    for token, author in _MODEL_AUTHORS:
+        if token in low:
+            return author
+    for token, author in _MODEL_NAME_AUTHORS:
+        if token in low:
+            return author
+    return ""
+
+
+def _model_title(name):
+    """A readable name for a checkpoint file."""
+    base = os.path.splitext(os.path.basename(name))[0]
+    for token, author in _MODEL_AUTHORS:
+        base = re.sub(rf"[-_ ]*{re.escape(token)}[-_ ]*", " ", base,
+                      flags=re.IGNORECASE)
+    base = base.replace("_", " ").replace("-", " ").strip()
+    return " ".join(base.split()).upper() or os.path.basename(name).upper()
+
+
+def _pair_config_for(ckpt, folder):
+    """The .yaml that goes with a checkpoint: the closest name match."""
+    base = os.path.splitext(os.path.basename(ckpt))[0].lower()
+    yamls = [f for f in os.listdir(folder)
+             if f.lower().endswith((".yaml", ".yml"))]
+    if not yamls:
+        return None
+    # Exactly the same name wins, then the longest shared run of characters.
+    for y in yamls:
+        if os.path.splitext(y)[0].lower() == base:
+            return os.path.join(folder, y)
+
+    def score(y):
+        yb = os.path.splitext(y)[0].lower().replace("config", "").strip("_- ")
+        common = 0
+        for token in re.split(r"[-_ .]+", yb):
+            if token and token in base:
+                common += len(token)
+        return common
+
+    best = max(yamls, key=score)
+    return os.path.join(folder, best) if score(best) > 2 else None
+
+
+def scan_models(role):
+    """Every (label, ckpt, yaml) pair in the models folder for *role*."""
+    folder = _MODELS_DIR
+    out = []
+    if not os.path.isdir(folder):
+        return out
+    hints = _MODEL_ROLES.get(role, ())
+    # "vocals" would otherwise match the karaoke and instrumental files too.
+    excl = {"vocals": _VOC_NAME_EXCLUDE,
+            "karaoke": _KARA_NAME_EXCLUDE,
+            "instrumental": _INST_NAME_EXCLUDE}.get(role, ())
+    for name in sorted(os.listdir(folder)):
+        if not name.lower().endswith((".ckpt", ".pth", ".th")):
+            continue
+        low = name.lower()
+        if excl and any(x in low for x in excl):
+            continue
+        if hints and not any(h in low for h in hints):
+            continue
+        ckpt = os.path.join(folder, name)
+        cfg = _pair_config_for(ckpt, folder)
+        if not cfg:
+            continue
+        author = _model_author(name)
+        label = _model_title(name) + (f"  ·  {author}" if author else "")
+        out.append((label, ckpt, cfg))
+    return out
+
+
+def _role_model(role):
+    """The loaded model object for a role, or None."""
+    return {"karaoke": lambda: kara_model,
+            "instrumental": lambda: inst_model,
+            "strings": lambda: strings_model,
+            "vocals": lambda: vocals_model,
+            "main": lambda: model}.get(role, lambda: None)()
+
+
+def _model_paths(role):
+    return {"karaoke": (_KARA_CKPT_PATH, _KARA_CFG_PATH),
+            "instrumental": (_INST_CKPT_PATH, _INST_CFG_PATH),
+            "strings": (_STR_CKPT_PATH, _STR_CFG_PATH),
+            "vocals": (_VOC_CKPT_PATH, _VOC_CFG_PATH),
+            "main": (_MAIN_CKPT_PATH, _MAIN_CFG_PATH)}.get(role, ("", ""))
+
+
+def _restore_model_paths(role, paths):
+    """Put a role's checkpoint paths back after a failed switch."""
+    global _KARA_CKPT_PATH, _KARA_CFG_PATH, kara_model, kara_model_ready
+    global _INST_CKPT_PATH, _INST_CFG_PATH, inst_model, inst_model_ready
+    global _STR_CKPT_PATH, _STR_CFG_PATH, strings_model, strings_model_ready
+    global _VOC_CKPT_PATH, _VOC_CFG_PATH, vocals_model, vocals_model_ready
+    global _MAIN_CKPT_PATH, _MAIN_CFG_PATH, model, model_ready
+    ck, cf = paths
+    if role == "karaoke":
+        _KARA_CKPT_PATH, _KARA_CFG_PATH = ck, cf
+        kara_model, kara_model_ready = None, False
+    elif role == "instrumental":
+        _INST_CKPT_PATH, _INST_CFG_PATH = ck, cf
+        inst_model, inst_model_ready = None, False
+    elif role == "strings":
+        _STR_CKPT_PATH, _STR_CFG_PATH = ck, cf
+        strings_model, strings_model_ready = None, False
+    elif role == "vocals":
+        _VOC_CKPT_PATH, _VOC_CFG_PATH = ck, cf
+        vocals_model, vocals_model_ready = None, False
+    elif role == "main":
+        _MAIN_CKPT_PATH, _MAIN_CFG_PATH = ck, cf
+        model, model_ready = None, False
+
+
+def _model_error_box(role, ckpt, cfg):
+    """Tell the user the files did not fit this slot, and why that happens."""
+    try:
+        messagebox.showerror(
+            "RAMMA — model not compatible",
+            f"{os.path.basename(ckpt)}\n\ncould not be loaded as the "
+            f"{role} model.\n\nThe usual causes are:\n"
+            f"  •  the .yaml does not belong to this .ckpt\n"
+            f"  •  the checkpoint is a different architecture than the "
+            f"config describes\n"
+            f"  •  it is a Mel-Band model and librosa is not installed\n\n"
+            f"Config used:\n{os.path.basename(cfg) if cfg else '(none)'}\n\n"
+            f"The previous model has been put back. The console shows the "
+            f"error the loader reported.")
+    except Exception:
+        pass
+
+
+def _apply_model_choice(role, ckpt, cfg):
+    """Point a role at a different checkpoint and load it again."""
+    prev = _model_paths(role)
+    global _KARA_CKPT_PATH, _KARA_CFG_PATH, kara_model, kara_model_ready
+    global _INST_CKPT_PATH, _INST_CFG_PATH, inst_model, inst_model_ready
+    global _STR_CKPT_PATH, _STR_CFG_PATH, strings_model, strings_model_ready
+    global _VOC_CKPT_PATH, _VOC_CFG_PATH, vocals_model, vocals_model_ready
+    global _MAIN_CKPT_PATH, _MAIN_CFG_PATH, model, model_ready
+
+    title, author = _model_title(ckpt), _model_author(ckpt)
+    print(f"[Models] {role}: switching to {os.path.basename(ckpt)}"
+          + (f" (by {author})" if author else ""))
+
+    if role == "karaoke":
+        _KARA_CKPT_PATH, _KARA_CFG_PATH = ckpt, cfg
+        kara_model, kara_model_ready = None, False
+        loader = load_kara_model
+    elif role == "instrumental":
+        _INST_CKPT_PATH, _INST_CFG_PATH = ckpt, cfg
+        inst_model, inst_model_ready = None, False
+        loader = load_inst_model
+    elif role == "strings":
+        _STR_CKPT_PATH, _STR_CFG_PATH = ckpt, cfg
+        strings_model, strings_model_ready = None, False
+        loader = load_strings_model
+    elif role == "vocals":
+        _VOC_CKPT_PATH, _VOC_CFG_PATH = ckpt, cfg
+        vocals_model, vocals_model_ready = None, False
+        loader = load_vocals_model
+    elif role == "main":
+        _MAIN_CKPT_PATH, _MAIN_CFG_PATH = ckpt, cfg
+        model, model_ready = None, False
+        loader = load_model
+    else:
+        return
+
+    _set_model_credit(role, title, author)
+
+    def _load_and_check():
+        loader()
+        if _role_model(role) is not None:
+            print(f"[Models] {role}: {os.path.basename(ckpt)} loaded")
+            return
+        # The loader prints why; put the previous model back so the cell is
+        # not left with nothing, and say plainly that the file did not fit.
+        print(f"[Models] {role}: {os.path.basename(ckpt)} could not be used — "
+              f"restoring the previous model")
+        _restore_model_paths(role, prev)
+        if prev[0]:
+            loader()
+        if running:
+            app.after(0, lambda: _model_error_box(role, ckpt, cfg))
+        app.after(0, sync_model_credits) if running else None
+
+    threading.Thread(target=_load_and_check, daemon=True).start()
+
+
+# Cells show the name and author of whichever model they are using.
+_model_credit_labels = {}     # role -> [(title label, author label), ...]
+
+
+def _register_model_credit(role, title_lbl, author_lbl):
+    _model_credit_labels.setdefault(role, []).append((title_lbl, author_lbl))
+
+
+def _set_model_credit(role, title, author):
+    """Show a model's name and author on every cell that uses that role.
+
+    An unknown author leaves the existing credit alone rather than replacing
+    it with a dash: not recognising a filename is no reason to strip the
+    name of whoever made the model.
+    """
+    for title_lbl, author_lbl in _model_credit_labels.get(role, []):
+        try:
+            title_lbl.configure(text=title)
+            if author:
+                author_lbl.configure(text=author)
+        except Exception:
+            pass
+
+
+def _found_ckpt_for(role):
+    """The checkpoint a role's own search would pick, or an empty string."""
+    try:
+        if role == "karaoke":
+            return _kara_find_files()[0] or ""
+        if role == "instrumental":
+            return _inst_find_files()[0] or ""
+        if role == "strings":
+            return _str_find_files()[0] or ""
+        if role == "vocals":
+            return _voc_find_files()[0] or ""
+    except Exception:
+        pass
+    return ""
+
+
+def sync_model_credits():
+    """Name the models actually in use, rather than the built-in defaults.
+
+    With several karaoke models installed the cells should credit the one
+    being loaded, not whichever was hard-coded when the cell was written.
+    """
+    for role in ("karaoke", "instrumental", "strings", "vocals"):
+        ckpt = _found_ckpt_for(role)
+        if not ckpt:
+            continue
+        _set_model_credit(role, _model_title(ckpt), _model_author(ckpt))
+
+
+_BROWSE_LABEL = "⋯  BROWSE FOR A MODEL…"
+
+
+def browse_for_model(role):
+    """Pick a .ckpt from anywhere, and the .yaml that goes with it."""
+    ckpt = filedialog.askopenfilename(
+        title=f"Choose the {role} checkpoint (.ckpt)",
+        initialdir=_MODELS_DIR if os.path.isdir(_MODELS_DIR) else None,
+        filetypes=[("Model checkpoints", "*.ckpt *.pth *.th"),
+                   ("All files", "*.*")])
+    if not ckpt:
+        return
+    # Always ask for the config as well. A checkpoint and a config that do
+    # not belong together fail in confusing ways, so the pairing is the
+    # user's to make rather than something guessed from filenames. A likely
+    # match is offered as the starting selection.
+    folder = os.path.dirname(ckpt)
+    guess = _pair_config_for(ckpt, folder)
+    cfg = filedialog.askopenfilename(
+        title=f"Choose the .yaml config for {os.path.basename(ckpt)}",
+        initialdir=folder,
+        initialfile=os.path.basename(guess) if guess else "",
+        filetypes=[("Model configs", "*.yaml *.yml"),
+                   ("All files", "*.*")])
+    if not cfg:
+        print("[Models] No config chosen — a checkpoint cannot be loaded "
+              "without one.")
+        if running:
+            try:
+                messagebox.showerror(
+                    "RAMMA — no config chosen",
+                    f"{os.path.basename(ckpt)} needs its .yaml config file "
+                    f"as well.\n\nNothing has been changed.")
+            except Exception:
+                pass
+        return
+    print(f"[Models] Chosen: {os.path.basename(ckpt)} + "
+          f"{os.path.basename(cfg)}")
+    _apply_model_choice(role, ckpt, cfg)
+
+
+def add_model_picker(cell, role, after=None):
+    """A collapsible "MODEL" row: click it to choose a different checkpoint.
+
+    Folded by default, because most of the time the choice never changes.
+    """
+    wrap = ctk.CTkFrame(cell, fg_color="transparent")
+    if after is not None:
+        wrap.pack(fill="x", after=after)
+    else:
+        wrap.pack(fill="x")
+
+    open_state = [False]
+    menu_holder = ctk.CTkFrame(wrap, fg_color="transparent")
+
+    header = ctk.CTkButton(wrap, text="▸ MODEL",
+                           fg_color=STEEL, hover_color=STEEL_LIGHT,
+                           text_color="#e6c000",     # gold: legible on steel
+                           font=("Courier New", 11, "bold"),
+                           corner_radius=0, border_width=1,
+                           border_color=BORDER, height=18)
+    header.pack(fill="x", padx=6, pady=(1, 0))
+
+    menu = ctk.CTkOptionMenu(
+        menu_holder, values=["(no models found)"],
+        font=("Courier New", 10), dropdown_font=("Courier New", 11),
+        fg_color=STEEL, button_color=RED, button_hover_color=BRIGHT_RED,
+        dropdown_fg_color=PANEL, dropdown_hover_color=STEEL,
+        text_color=TEXT_MAIN, corner_radius=0, height=22)
+    menu.pack(fill="x", padx=6, pady=(1, 2))
+
+    def _refresh():
+        pairs = scan_models(role)
+        if not pairs:
+            menu.configure(values=[_BROWSE_LABEL, "(none in the models folder)"])
+            menu.set("(none in the models folder)")
+            return []
+        menu.configure(values=[p[0] for p in pairs] + [_BROWSE_LABEL])
+        # Show the one actually in use: the explicit path when set, else
+        # whatever the loader's own search found.
+        current = {"karaoke": _KARA_CKPT_PATH, "instrumental": _INST_CKPT_PATH,
+                   "strings": _STR_CKPT_PATH, "vocals": _VOC_CKPT_PATH,
+                   "main": _MAIN_CKPT_PATH}.get(role, "")
+        if not current:
+            current = _found_ckpt_for(role)
+        for label, ckpt, _cfg in pairs:
+            if current and os.path.abspath(ckpt) == os.path.abspath(current):
+                menu.set(label)
+                break
+        else:
+            menu.set(pairs[0][0])
+        return pairs
+
+    def _chosen(label):
+        if label == _BROWSE_LABEL:
+            browse_for_model(role)
+            _refresh()
+            return
+        for lab, ckpt, cfg in scan_models(role):
+            if lab == label:
+                _apply_model_choice(role, ckpt, cfg)
+                return
+
+    menu.configure(command=_chosen)
+
+    def _toggle():
+        open_state[0] = not open_state[0]
+        if open_state[0]:
+            _refresh()
+            menu_holder.pack(fill="x", after=header)
+            header.configure(text="▾ MODEL")
+        else:
+            menu_holder.pack_forget()
+            header.configure(text="▸ MODEL")
+
+    header.configure(command=_toggle)
+    return wrap
+
+
+# ============================================================
 # AUTO-UPDATE
 # Checks the GitHub repository for a newer ramma.py and offers to install it.
 # The new file is compiled before it replaces anything, and the running one
@@ -1137,6 +1614,10 @@ _INST_SEARCH_DIRS = [
 # A file whose name contains any of these is preferred when a folder holds
 # several checkpoints.
 _INST_NAME_HINTS = ("resurrection", "unwa", "inst")
+# "inst" also matches instvoc-style vocal models, and karaoke files are not
+# instrumental models either.
+_INST_NAME_EXCLUDE = ("karaoke", "kara", "instvoc", "inst_voc", "instvocal",
+                      "vocals", "bowed", "string")
 
 # ── gilliaan's bowed strings model ─────────────────────────────────────────
 # Same arrangement as the instrumental model: point these at the files, or
@@ -1149,7 +1630,68 @@ _STR_SEARCH_DIRS = [
     os.getcwd(),
 ]
 _STR_NAME_HINTS = ("bowed", "string", "gilliaan")
+
+# ── Vocals model (becruily's, by default) ─────────────────────────────────
+# The six-stem model's vocals are good enough to start mixing with, but a
+# dedicated vocals model does the job far better. It runs on the MAIN TRACK
+# — not on the six-stem vocals — and its result replaces the VOCALS cell.
+# The karaoke split then runs on that, so the lead and backing come from the
+# better vocal.
+_VOC_CKPT_PATH = ""
+_VOC_CFG_PATH  = ""
+_VOC_SEARCH_DIRS = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),
+    os.path.dirname(os.path.abspath(__file__)),
+    os.getcwd(),
+]
+# A vocals model, not the karaoke one and not an instrumental one.
+_VOC_NAME_HINTS   = ("vocals", "voc")
+# Only the things a vocals model definitely is not. "inst" is deliberately
+# absent: plenty of vocal models are named instvoc / inst_voc, and a real
+# instrumental model has no "voc" in its name to match on in the first place.
+_VOC_NAME_EXCLUDE = ("karaoke", "kara", "bowed", "string",
+                     "sw-fixed", "sw_fixed", "rofo-sw")
+_VOC_TITLE  = "VOCALS MODEL"
+_VOC_CREDIT = "by becruily"
+_VOC_AUTO   = True       # refine the vocals after every separation
+
+vocals_model       = None
+vocals_model_ready = False
+_vocals_refining   = False
+_voc_load_lock  = threading.Lock()
+_voc_sr         = 44100
+_voc_stem_idx   = 0
+_voc_chunk_s    = 8.0
+_voc_overlap_s  = _OVERLAP_SECONDS
+
+
+def _voc_find_files():
+    """Locate a dedicated vocals checkpoint and its config."""
+    ck = _VOC_CKPT_PATH if _VOC_CKPT_PATH and os.path.isfile(_VOC_CKPT_PATH) else None
+    cf = _VOC_CFG_PATH  if _VOC_CFG_PATH  and os.path.isfile(_VOC_CFG_PATH)  else None
+    if ck and cf:
+        return ck, cf
+    for folder in _VOC_SEARCH_DIRS:
+        if not os.path.isdir(folder):
+            continue
+        cks, cfs = [], []
+        for name in os.listdir(folder):
+            low = name.lower()
+            if any(x in low for x in _VOC_NAME_EXCLUDE):
+                continue
+            if not any(h in low for h in _VOC_NAME_HINTS):
+                continue
+            full = os.path.join(folder, name)
+            if low.endswith((".ckpt", ".pth", ".th")):
+                cks.append(full)
+            elif low.endswith((".yaml", ".yml")):
+                cfs.append(full)
+        if cks and cfs:
+            return sorted(cks)[0], sorted(cfs)[0]
+    return ck, cf
 _STR_AUTO   = True        # run the strings model after every track
+_STR_FIRST  = False       # run it before the six-stem pass, so the strings
+                          # are playable sooner (the stems then follow)
 _STR_QUICK  = True        # fill the cell from OTHER until the model has run,
                           # exactly as the instrumental cell does. No switch:
                           # it costs nothing and is replaced by the model.
@@ -1224,7 +1766,12 @@ _KARA_TITLE  = "MEL-BAND KARAOKE"
 _KARA_CREDIT = "by becruily"
 _KARA_CKPT_PATH = ""      # set to name the files directly
 _KARA_CFG_PATH  = ""
-_KARA_NAME_HINTS = ("karaoke", "becruily")
+# Must actually say "karaoke": matching on an author's name alone grabbed
+# that author's other models — becruily's vocals model was being loaded as
+# the karaoke model, which is why the lead/backing split came out wrong.
+_KARA_NAME_HINTS   = ("karaoke", "kara")
+_KARA_NAME_EXCLUDE = ("instvoc", "inst_voc", "instrum", "resurrection",
+                      "bowed", "string", "sw-fixed", "sw_fixed", "rofo-sw")
 
 kara_model        = None            # loaded nn.Module
 kara_model_ready  = False
@@ -1447,6 +1994,9 @@ def _inst_find_files():
 
     def _pick(files):
         """Prefer a hinted name, else the single candidate, else None."""
+        files = [f for f in files
+                 if not any(x in os.path.basename(f).lower()
+                            for x in _INST_NAME_EXCLUDE)]
         hinted = [f for f in files
                   if any(h in os.path.basename(f).lower() for h in _INST_NAME_HINTS)]
         if hinted:
@@ -1651,65 +2201,10 @@ def _split_halves_exist():
     return state.fv_data is not None or state.bg_vocals_data is not None
 
 
-# STRINGS is taken out of the same material as OTHER — the quick mix is a
-# copy of it, and the model pulls the strings out of the full mix, most of
-# which sits in OTHER. Playing both therefore counts that material twice and
-# the level jumps. They are treated as one pair, like VOCALS and its halves:
-# one of them plays at a time.
-_other_muted_by_strings = [False]
-
-
-def _strings_live():
-    """True when the STRINGS cell holds audio and is not muted."""
-    return (state.strings_data is not None
-            and not state.stem_mute.get("strings", False))
-
-
-def _swap_to_strings():
-    """Hand OTHER's place to STRINGS, as the split does for the vocals."""
-    if state.strings_data is None:
-        return
-    if not state.stem_mute.get("other", False):
-        state.stem_mute["other"] = True
-        _other_muted_by_strings[0] = True
-    state.stem_mute["strings"] = False
-    for _k in ("other", "strings"):
-        try:
-            _paint_ms(_k)
-        except (NameError, KeyError):
-            pass
-
-
-def _strings_toggled():
-    """The STRINGS M button: switch between STRINGS and OTHER."""
-    if _strings_live():
-        if not state.stem_mute.get("other", False):
-            state.stem_mute["other"] = True
-            _other_muted_by_strings[0] = True
-    elif _other_muted_by_strings[0]:
-        state.stem_mute["other"] = False
-        _other_muted_by_strings[0] = False
-    for _k in ("other", "strings"):
-        try:
-            _paint_ms(_k)
-        except (NameError, KeyError):
-            pass
-
-
-def _other_toggled():
-    """The OTHER M button: bringing it back mutes STRINGS, and vice versa."""
-    if not state.stem_mute.get("other", False):
-        _other_muted_by_strings[0] = False
-        if _strings_live():
-            state.stem_mute["strings"] = True
-    elif state.strings_data is not None and \
-            state.stem_mute.get("strings", False):
-        state.stem_mute["strings"] = False
-    for _k in ("other", "strings"):
-        try:
-            _paint_ms(_k)
-        except (NameError, KeyError):
-            pass
+# STRINGS and OTHER are independent cells: both play unless you mute one.
+# They do carry some of the same material, so the two together are louder
+# than either alone — the Ø PHASE button on each is there for judging how
+# much they share, and muting is yours to decide.
 
 
 def _vocals_toggled_with_split():
@@ -1737,12 +2232,55 @@ def _vocals_toggled_with_split():
 
 
 def _restore_vocals_mute():
-    """Put the VOCALS stem's mute back to what it should be right now."""
+    """Put the VOCALS stem's mute back to what it should be right now.
+
+    Once VOCALS is a VCA it carries no audio, and its mute means "silence
+    both halves". Muting it automatically — which is what the old rule did
+    whenever a half was active — therefore silenced the very cells it was
+    meant to be making way for.
+    """
+    if getattr(state, "vocals_is_vca", False):
+        state.stem_mute["vocals"] = False
+        try:
+            _paint_ms("vocals")
+        except (NameError, KeyError):
+            pass
+        return
     state.stem_mute["vocals"] = _split_vocals_active()
     try:
         _paint_ms("vocals")
     except (NameError, KeyError):
         pass
+
+
+def _split_replaces_vocals():
+    """Hand the vocal over to FRT VOX + BG VOX.
+
+    The VOCALS cell stays in the mixer but stops carrying audio: from here
+    it is a VCA over the two halves, so its fader, M and S move both at
+    once. Its own mute is cleared — muting it would now mean silencing the
+    halves, which is not what was asked for by the split landing.
+    """
+    # Un-mute the two halves. They were muted when the stems landed, back
+    # when they held nothing; without this they stay silent and the split
+    # looks as though it produced nothing at all.
+    _swap_to_split_vocals()
+
+    # VOCALS carries no audio from here, so its own mute must be clear: as
+    # a VCA, muting it means silencing both halves, which is not what the
+    # split landing should do.
+    state.vocals_is_vca = True
+    state.stem_mute["vocals"] = False
+    for _k in ("vocals", "front_vocals", "bg_vocals"):
+        try:
+            _paint_ms(_k)
+        except Exception:
+            pass
+    if running:
+        try:
+            _update_vocals_status()
+        except Exception:
+            pass
 
 
 def _swap_to_split_vocals():
@@ -1856,8 +2394,13 @@ def _kara_find_files():
         return ck, cf
 
     def _hinted(files):
-        hits = [f for f in files
-                if any(h in os.path.basename(f).lower() for h in _KARA_NAME_HINTS)]
+        hits = []
+        for f in files:
+            low = os.path.basename(f).lower()
+            if any(x in low for x in _KARA_NAME_EXCLUDE):
+                continue
+            if any(h in low for h in _KARA_NAME_HINTS):
+                hits.append(f)
         return sorted(hits)[0] if hits else None
 
     for d in _INST_SEARCH_DIRS:
@@ -1933,7 +2476,7 @@ def load_kara_model():
             is_mel = ("mel_band" in name_hint or "mel-band" in name_hint
                       or "num_bands" in dict(kara_cfg.model))
 
-            if is_mel and not _librosa_ok:
+            if is_mel and not _ensure_librosa():
                 raise RuntimeError(
                     "A Mel-Band RoFormer needs the real librosa. This model "
                     "asks librosa.filters.mel how many FFT bins belong to each "
@@ -2002,7 +2545,7 @@ def load_kara_model():
                 sd = sd["state_dict"]
             if isinstance(sd, dict):
                 sd = {k[7:] if k.startswith("module.") else k: v for k, v in sd.items()}
-            m.load_state_dict(sd)
+            _load_state_forgiving(m, sd, os.path.basename(ckpt_path))
 
             # Which output is the backing vocals, and which the lead?
             _kara_back_idx, _kara_lead_idx = None, None
@@ -2035,6 +2578,107 @@ def load_kara_model():
         kara_model_ready = True
 
 
+# How the two karaoke outputs are assigned to the cells.
+#   "auto"   — follow the config, but swap if the audio says otherwise
+#   "config" — trust the config's stem names
+#   "swap"   — always the other way round
+_KARA_ORIENT = "auto"
+# Take BG VOX as "the vocals stem minus the lead" instead of using whatever
+# the model calls its second output. The input to this pass is the separated
+# VOCALS stem, so the residue is by definition the rest of the singing —
+# nothing instrumental can appear in it, whatever a given karaoke model
+# names its outputs or which order it emits them in. Set to False to use the
+# model's own second output.
+_KARA_BACKING_FROM_RESIDUE = True
+_KARA_SWAP_MARGIN_DB = 2.5     # how much louder before "auto" believes it
+
+
+def _rms_db(x):
+    if x is None or len(x) == 0:
+        return -120.0
+    r = float(np.sqrt(np.mean(np.asarray(x, dtype=np.float32) ** 2)))
+    return 20.0 * np.log10(max(r, 1e-9))
+
+
+def toggle_backing_source():
+    """Switch BG VOX between the model's own output and the residue.
+
+    Which sounds better depends on the karaoke model: the residue can never
+    contain anything that was not in the vocals stem, but it also carries
+    whatever the lead half left behind, artefacts included.
+    """
+    global _KARA_BACKING_FROM_RESIDUE
+    _KARA_BACKING_FROM_RESIDUE = not _KARA_BACKING_FROM_RESIDUE
+    src = "the vocals-stem residue" if _KARA_BACKING_FROM_RESIDUE else \
+          "the model's own second output"
+    print(f"[Karaoke] BG VOX will come from {src} — press ⟳ SPLIT VOX to "
+          f"hear the difference")
+    btn = globals().get("_backing_src_btn")
+    if btn is not None:
+        try:
+            btn.configure(text="BG: RESIDUE" if _KARA_BACKING_FROM_RESIDUE
+                          else "BG: MODEL")
+        except Exception:
+            pass
+
+
+def swap_vocal_halves():
+    """Exchange FRT VOX and BG VOX, for when the automatic choice is wrong."""
+    with audio_lock:
+        state.fv_data, state.bg_vocals_data = (state.bg_vocals_data,
+                                               state.fv_data)
+        state.fv_sr, state.bg_vocals_sr = state.bg_vocals_sr, state.fv_sr
+    print("[Karaoke] FRT VOX and BG VOX swapped by hand")
+    if running:
+        for fn in ("_update_bgv_button", "_update_fv_button"):
+            f = globals().get(fn)
+            if f is not None:
+                try:
+                    f()
+                except Exception:
+                    pass
+
+
+def _orient_halves(lead, back):
+    """Return (lead, back) the right way round, whatever the model's order.
+
+    Config stem names are not reliable across karaoke models: some list the
+    lead first, some the backing, and some name them in ways that match
+    neither. The lead vocal is reliably the louder and more continuous of
+    the two, so when the halves look swapped by that measure, they are put
+    back. Set _KARA_ORIENT to "config" to trust the names instead.
+    """
+    if lead is None or back is None:
+        return lead, back
+    if _KARA_ORIENT == "config":
+        return lead, back
+    if _KARA_ORIENT == "swap":
+        print("[Karaoke] Halves swapped (_KARA_ORIENT = 'swap')")
+        return back, lead
+
+    lead_db, back_db = _rms_db(lead), _rms_db(back)
+    # "Activity": how much of the time each half is actually sounding. The
+    # lead sings through most of a song; backing vocals come and go.
+    def _active(x):
+        mono = np.abs(np.mean(np.asarray(x, dtype=np.float32), axis=1))
+        step = max(1, len(mono) // 2000)
+        frames = mono[:len(mono) // step * step].reshape(-1, step).max(axis=1)
+        peak = float(frames.max()) if len(frames) else 0.0
+        if peak <= 1e-6:
+            return 0.0
+        return float(np.mean(frames > peak * 0.05))
+
+    lead_act, back_act = _active(lead), _active(back)
+    print(f"[Karaoke] FRT candidate {lead_db:.1f} dB, {lead_act * 100:.0f}% "
+          f"active | BG candidate {back_db:.1f} dB, {back_act * 100:.0f}% active")
+    if (back_db - lead_db) > _KARA_SWAP_MARGIN_DB and back_act >= lead_act:
+        print("[Karaoke] The backing half is the louder and busier of the "
+              "two — this model lists its outputs the other way round, so "
+              "the halves have been swapped.")
+        return back, lead
+    return lead, back
+
+
 def separate_bg_vocals(into=None, cancel=None):
     """Split the separated vocals into lead and backing, keeping both.
 
@@ -2047,6 +2691,7 @@ def separate_bg_vocals(into=None, cancel=None):
     global _kara_separating
     bg = into is not None
     if not bg and _kara_separating:
+        print("[Karaoke] A split is already running — not starting another")
         return
     if not bg:
         _kara_separating = True
@@ -2068,12 +2713,14 @@ def separate_bg_vocals(into=None, cancel=None):
     elif state.stems:
         src = state.stems.get("vocals")
     if src is None:
+        print("[Karaoke] No VOCALS stem to split — FRT VOX and BG VOX stay "
+              "empty. (The six-stem pass has to finish first.)")
         if not bg:
             _kara_separating = False
         return
 
     if not bg:
-        _fg_enter()
+        _fg_enter("karaoke split")
     else:
         _bg_wait_for_foreground(cancel)
         if cancel is not None and cancel.is_set():
@@ -2142,7 +2789,13 @@ def separate_bg_vocals(into=None, cancel=None):
                         out_t = kara_model(x)
                     if out_t.dim() == 4:
                         n_out = out_t.shape[1]
-                        b_idx = min(_kara_back_idx, n_out - 1)
+                        # The config may not have named its stems, leaving
+                        # these unset; fall back to "the second output is
+                        # the backing" rather than failing the whole pass.
+                        b_idx = _kara_back_idx
+                        if b_idx is None:
+                            b_idx = 1 if n_out > 1 else 0
+                        b_idx = min(b_idx, n_out - 1)
                         l_idx = _kara_lead_idx
                         if l_idx is None or l_idx >= n_out or l_idx == b_idx:
                             l_idx = 1 - b_idx if n_out > 1 else None
@@ -2183,6 +2836,26 @@ def separate_bg_vocals(into=None, cancel=None):
         out_back /= wgt[:, None]
         out_lead /= wgt[:, None]
         have_lead = bool(np.any(out_lead))
+
+        if not have_lead:
+            # Only one output came back — either the model emits a single
+            # stem (a 3-D result), or its config never said which output is
+            # the lead. The two halves always sum to the vocal that went in,
+            # so the missing one is simply the rest of it. Without this the
+            # cell that did not get a stem stays empty and the split looks
+            # like it failed.
+            ref = np.asarray(src, dtype=np.float32)
+            n = min(len(ref), len(out_back))
+            derived = np.zeros_like(out_back)
+            derived[:n] = ref[:n] - out_back[:n]
+            if np.any(derived):
+                out_lead = derived
+                have_lead = True
+                print("[Karaoke] The model returned one stem; the other half "
+                      "was taken as what it leaves behind in the vocal.")
+            else:
+                print("[Karaoke] The model returned one stem and it accounts "
+                      "for the whole vocal — nothing left for the other cell.")
         if sr_i != in_sr:
             out_back = _resample_to(out_back, sr_i, in_sr)
             if have_lead:
@@ -2191,6 +2864,36 @@ def separate_bg_vocals(into=None, cancel=None):
         el = time.perf_counter() - t0
         print(f"[Karaoke] Lead + backing vocals in {el:.1f}s "
               f"({(n_samples / sr_i) / max(el, 1e-6):.1f}x realtime)")
+
+        if have_lead:
+            out_lead, out_back = _orient_halves(out_lead, out_back)
+
+            if _KARA_BACKING_FROM_RESIDUE:
+                # BG VOX = what the lead leaves behind in the vocals stem.
+                ref = np.asarray(src, dtype=np.float32)
+                n = min(len(ref), len(out_lead))
+                residue = np.zeros_like(out_lead)
+                residue[:n] = ref[:n] - out_lead[:n]
+                model_db, res_db = _rms_db(out_back), _rms_db(residue)
+                print(f"[Karaoke] Backing: model output {model_db:.1f} dB, "
+                      f"residue of the vocals stem {res_db:.1f} dB "
+                      f"— using the residue")
+                out_back = residue
+
+        # Warn when a model plainly did not split anything, rather than
+        # filling both cells with the same audio.
+        if have_lead:
+            ref = np.asarray(src, dtype=np.float32)
+            n = min(len(ref), len(out_lead))
+            if n:
+                a = out_lead[:n].ravel()
+                b = ref[:n].ravel()
+                denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+                corr = float(np.dot(a, b) / denom) if denom > 1e-9 else 0.0
+                if corr > 0.999:
+                    print("[Karaoke] This model returned the vocals unchanged "
+                          "— it does not appear to split lead from backing. "
+                          "FRT VOX holds the whole vocal and BG VOX is empty.")
 
         if bg:
             into["bg_vocals"] = out_back
@@ -2206,7 +2909,7 @@ def separate_bg_vocals(into=None, cancel=None):
         print(f"[Karaoke] FRT VOX: {'filled' if have_lead else 'empty'} | "
               f"BG VOX: filled — the VOCALS stem is muted in their favour")
         if running:
-            app.after(0, _swap_to_split_vocals)
+            app.after(0, _split_replaces_vocals)
             app.after(0, _update_bgv_button)
             app.after(0, _update_fv_button)
     except Exception as e:
@@ -2264,10 +2967,9 @@ def load_strings_model():
             is_mel = ("mel" in os.path.basename(cfg_path).lower()
                       or "mel" in os.path.basename(ckpt_path).lower()
                       or bool(str_cfg.model.get("num_bands", 0)))
-            if is_mel and not _librosa_ok:
-                raise RuntimeError(
-                    "This is a Mel-Band model and needs the real librosa: "
-                    "python -m pip install librosa")
+            if is_mel and not _ensure_librosa():
+                print("[Models] Mel-Band model without librosa — trying the "
+                      "built-in filterbank rather than refusing outright.")
             arch = "mel_band_roformer" if is_mel else "bs_roformer"
             if is_mel:
                 # ZFTurbo's mel_band_roformer.py imports models.bs_roformer;
@@ -2294,7 +2996,7 @@ def load_strings_model():
             if isinstance(sd, dict):
                 sd = {k[7:] if k.startswith("module.") else k: v
                       for k, v in sd.items()}
-            m.load_state_dict(sd)
+            _load_state_forgiving(m, sd, os.path.basename(ckpt_path))
 
             # Which output holds the strings?
             _str_stem_idx = 0
@@ -2319,8 +3021,215 @@ def load_strings_model():
         strings_model_ready = True
 
 
-def separate_strings(path, cancel=None):
-    """Run the bowed-strings model over *path* into state.strings_data."""
+def load_vocals_model():
+    """Load the dedicated vocals model."""
+    global vocals_model, vocals_model_ready, _voc_sr, _voc_stem_idx
+    global _voc_chunk_s, _voc_overlap_s
+    with _voc_load_lock:
+        if vocals_model_ready:
+            return
+        try:
+            ckpt_path, cfg_path = _voc_find_files()
+            if not ckpt_path or not cfg_path:
+                raise FileNotFoundError(
+                    "No dedicated vocals model found — the six-stem vocals "
+                    "will be used as they are.")
+            print(f"[Vocals] Checkpoint: {ckpt_path}")
+            print(f"[Vocals] Config:     {cfg_path}")
+
+            import yaml
+            _bsr = _import_bs_roformer()
+            get_model_from_config = _bsr["get_model_from_config"]
+            _YL = _bsr["yaml_loader"]
+            from ml_collections import ConfigDict
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                voc_cfg = ConfigDict(yaml.load(f, Loader=_YL))
+
+            try:
+                _voc_sr = int(voc_cfg.audio.sample_rate)
+            except Exception:
+                _voc_sr = 44100
+            _voc_chunk_s, _voc_overlap_s = _chunking_from_config(voc_cfg, _voc_sr)
+            print(f"[Vocals] Chunking from config: {_voc_chunk_s:.2f}s chunks, "
+                  f"{_voc_overlap_s:.2f}s overlap per side")
+
+            name_hint = (os.path.basename(ckpt_path) +
+                         os.path.basename(cfg_path)).lower()
+            is_mel = ("mel_band" in name_hint or "mel-band" in name_hint
+                      or bool(voc_cfg.model.get("num_bands", 0)))
+            if is_mel and not _ensure_librosa():
+                print("[Models] Mel-Band model without librosa — trying the "
+                      "built-in filterbank rather than refusing outright.")
+            if is_mel:
+                try:
+                    import bs_roformer as _bsr_pkg
+                    if "models" not in sys.modules:
+                        _shim = types.ModuleType("models")
+                        _shim.__path__ = []
+                        sys.modules["models"] = _shim
+                    sys.modules.setdefault("models.bs_roformer", _bsr_pkg)
+                    setattr(sys.modules["models"], "bs_roformer", _bsr_pkg)
+                except Exception:
+                    pass
+            arch = "mel_band_roformer" if is_mel else "bs_roformer"
+
+            m = get_model_from_config(arch, voc_cfg)
+            if m is None:
+                raise RuntimeError("get_model_from_config returned None")
+
+            sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            if isinstance(sd, dict) and "state_dict" in sd:
+                sd = sd["state_dict"]
+            if isinstance(sd, dict):
+                sd = {k[7:] if k.startswith("module.") else k: v
+                      for k, v in sd.items()}
+            _load_state_forgiving(m, sd, os.path.basename(ckpt_path))
+
+            # Which output holds the vocals?
+            _voc_stem_idx = 0
+            try:
+                stems = [str(x).lower() for x in voc_cfg.training.instruments]
+                print(f"[Vocals] Stems in config: {stems}")
+                for i, name in enumerate(stems):
+                    if "vocal" in name and "back" not in name:
+                        _voc_stem_idx = i
+                        break
+            except Exception:
+                pass
+
+            m.to(device)
+            m.eval()
+            vocals_model = m
+            print(f"[Vocals] Model ready on {device} ({_voc_sr} Hz, "
+                  f"vocals = output {_voc_stem_idx})")
+        except Exception as e:
+            print(f"[Vocals] {e}")
+        vocals_model_ready = True
+
+
+def refine_vocals(path, cancel=None):
+    """Run the vocals model over the MAIN TRACK and replace the VOCALS stem.
+
+    Deliberately takes the original file rather than the six-stem vocals:
+    feeding it an already-separated stem would pile one model's mistakes on
+    top of another's.
+    """
+    global _vocals_refining
+    if _vocals_refining:
+        return False
+    if not vocals_model_ready:
+        load_vocals_model()
+    if vocals_model is None:
+        return False
+
+    _vocals_refining = True
+    _fg_enter("vocals model")
+    if running:
+        app.after(0, _update_vocals_status)
+    try:
+        audio, file_sr = _read_audio_file(path)
+        audio = _resample_audio(audio, file_sr)
+        sr_i = int(state.sr or _voc_sr)
+        x_full = audio.T.astype(np.float32)
+        n_samples = x_full.shape[1]
+
+        chunk_n   = int(_voc_chunk_s * sr_i)
+        overlap_n = int(_voc_overlap_s * sr_i)
+        step_n    = max(1, chunk_n - 2 * overlap_n)
+        fade = np.ones(chunk_n, dtype=np.float32)
+        if overlap_n > 0:
+            fade[:overlap_n]  = np.linspace(0, 1, overlap_n)
+            fade[-overlap_n:] = np.linspace(1, 0, overlap_n)
+
+        out = np.zeros((2, n_samples), dtype=np.float32)
+        wgt = np.zeros(n_samples, dtype=np.float32)
+        starts  = list(range(0, n_samples, step_n))
+        batch_n = _batch_size_for(device, chunk_n / sr_i)
+        use_fp16 = _INFER_FP16
+        run_device = device
+        ci = 0
+        t0 = time.time()
+
+        with _infer_ctx():
+            i = 0
+            while i < len(starts):
+                if cancel is not None and cancel.is_set():
+                    print("[Vocals] Cancelled")
+                    return False
+                batch_starts = starts[i:i + batch_n]
+                chunks, kept = [], []
+                for st_i in batch_starts:
+                    seg = x_full[:, st_i:st_i + chunk_n]
+                    if seg.shape[1] < chunk_n:
+                        seg = np.pad(seg, ((0, 0), (0, chunk_n - seg.shape[1])))
+                    chunks.append(seg)
+                    kept.append(st_i)
+                try:
+                    xb = torch.from_numpy(np.ascontiguousarray(np.stack(chunks)))
+                    xb = (xb.pin_memory().to(run_device, non_blocking=True)
+                          if run_device.type == "cuda" else xb.to(run_device))
+                    with _amp_ctx(run_device, use_fp16):
+                        pred = vocals_model(xb)
+                    arr = pred.float().cpu().numpy()
+                except RuntimeError as e:
+                    if run_device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    if batch_n > 1:
+                        batch_n = max(1, batch_n // 2)
+                        print(f"[Vocals] {e}\n[Vocals] Retrying with batch {batch_n}")
+                        continue
+                    if use_fp16:
+                        use_fp16 = False
+                        print(f"[Vocals] {e}\n[Vocals] Retrying in full precision")
+                        continue
+                    raise
+
+                if arr.ndim == 4:
+                    arr = arr[:, min(_voc_stem_idx, arr.shape[1] - 1)]
+                for bi, st_i in enumerate(kept):
+                    actual = min(chunk_n, n_samples - st_i, arr.shape[-1])
+                    w = fade[:actual]
+                    out[:, st_i:st_i + actual] += arr[bi, :, :actual] * w[None, :]
+                    wgt[st_i:st_i + actual]    += w
+                ci += len(batch_starts)
+                i  += len(batch_starts)
+                if running:
+                    app.after(0, lambda v=min(0.99, ci / max(1, len(starts))):
+                              _set_vocals_progress(v))
+
+        np.divide(out, np.maximum(wgt, 1e-8)[None, :], out=out)
+        refined = np.ascontiguousarray(out.T)
+        with audio_lock:
+            if state.stems:
+                n = min(len(refined), state.stems["vocals"].shape[0])
+                state.stems["vocals"][:n] = refined[:n]
+                if n < state.stems["vocals"].shape[0]:
+                    state.stems["vocals"][n:] = 0.0
+            state.vocals_refined = True
+        el = time.time() - t0
+        print(f"[Vocals] Refined vocals in {el:.1f}s "
+              f"({n_samples / sr_i / max(el, 1e-6):.1f}x realtime) — the "
+              f"VOCALS cell now holds the dedicated model's output")
+        return True
+    except Exception as e:
+        print(f"[Vocals] Separation error: {e}")
+        return False
+    finally:
+        _fg_leave()
+        _vocals_refining = False
+        if running:
+            app.after(0, _clear_vocals_progress)
+            app.after(0, _update_vocals_status)
+
+
+def separate_strings(path=None, cancel=None):
+    """Pull the bowed strings out of the OTHER stem.
+
+    The six-stem model has already set the strings aside in OTHER, so that
+    is what this works on rather than the whole mix. Afterwards STRINGS
+    holds what the model found and OTHER holds the rest: the two are
+    complementary, so nothing is heard twice.
+    """
     global _strings_separating
     if _strings_separating:
         return
@@ -2329,12 +3238,14 @@ def separate_strings(path, cancel=None):
     if strings_model is None:
         print("[Strings] No model loaded — the STRINGS cell stays empty.")
         return
+    if not state.stems or state.stems.get("other") is None:
+        print("[Strings] No OTHER stem yet — nothing to take the strings from.")
+        return
 
     _strings_separating = True
-    _fg_enter()
+    _fg_enter("strings")
     try:
-        audio, file_sr = _read_audio_file(path)
-        audio = _resample_audio(audio, file_sr)
+        audio = np.asarray(state.stems["other"], dtype=np.float32).copy()
         sr_i = int(state.sr or _str_sr)
         x_full = audio.T.astype(np.float32)          # (2, N)
         n_samples = x_full.shape[1]
@@ -2407,15 +3318,23 @@ def separate_strings(path, cancel=None):
                               _set_strings_progress(v))
 
         np.divide(out, np.maximum(wgt, 1e-8)[None, :], out=out)
+        strings = np.ascontiguousarray(out.T)
         with audio_lock:
-            state.strings_data = np.ascontiguousarray(out.T)
+            state.strings_data = strings
             state.strings_sr   = sr_i
             state.strings_is_quick = False
+            # OTHER becomes what is left once the strings are taken out —
+            # the same as summing OTHER with an inverted copy of them.
+            if state.stems and state.stems.get("other") is not None:
+                other = state.stems["other"]
+                n = min(len(other), len(strings))
+                other[:n] -= strings[:n]
+                print("[Strings] OTHER now holds what is left after the "
+                      "strings were removed")
         el = time.time() - t0
         print(f"[Strings] Strings in {el:.1f}s "
               f"({n_samples / sr_i / max(el, 1e-6):.1f}x realtime)")
         if running:
-            app.after(0, _swap_to_strings)
             app.after(0, _update_strings_button)
     except Exception as e:
         print(f"[Strings] Separation error: {e}")
@@ -2497,7 +3416,7 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
             print("[Inst] Pre-load cancelled")
             return
     else:
-        _fg_enter()
+        _fg_enter("instrumental")
     try:
         print(f"[Inst] {'Pre-loading' if bg else 'Starting'} instrumental separation "
               f"of {os.path.basename(path)!r} ...")
@@ -2683,6 +3602,7 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
 threading.Thread(target=load_inst_model, daemon=True).start()
 threading.Thread(target=load_kara_model, daemon=True).start()
 threading.Thread(target=load_strings_model, daemon=True).start()
+threading.Thread(target=load_vocals_model, daemon=True).start()
 
 
 # ----------------------------
@@ -2718,6 +3638,10 @@ class AppState:
     stem_widths:  dict = dataclasses.field(default_factory=dict)  # key -> 0.0–2.0
     stem_reverbs: dict = dataclasses.field(default_factory=dict)  # key -> 0.0–1.0
     stem_air:     dict = dataclasses.field(default_factory=dict)  # key -> -1.0–1.0
+    # Cells whose polarity is flipped (Ø). Inverting one of a pair of cells
+    # that share material cancels what they have in common, which is how you
+    # hear what is only in one of them.
+    stem_invert: dict = dataclasses.field(default_factory=dict)
     stem_pan:     dict = dataclasses.field(default_factory=dict)  # key -> -1.0–1.0
     stem_mute:    dict = dataclasses.field(default_factory=dict)  # key -> bool
     stem_solo:    dict = dataclasses.field(default_factory=dict)  # key -> bool
@@ -2815,6 +3739,10 @@ class AppState:
     last_atmos_br_dir: Optional[str]  = None
 
     # ── Bowed strings, from gilliaan's model ──────────────────────
+    vocals_refined: bool             = False
+    # Once the karaoke split has run, VOCALS carries no audio of its own:
+    # its fader, M and S act on FRT VOX and BG VOX together.
+    vocals_is_vca:  bool             = False
     strings_data:   Optional[object] = None
     strings_is_quick: bool           = False
     strings_sr:     Optional[int]    = None
@@ -3974,6 +4902,11 @@ def mix(start, frames):
     # Every cell that can be soloed, not only the separated stems. A cell
     # missing from here can be soloed without silencing anything else, which
     # looks exactly like solo being broken.
+    # VOCALS as a VCA: it holds nothing itself, and its controls apply to
+    # the two halves.
+    _vca = bool(getattr(state, "vocals_is_vca", False))
+    _vca_vol = float(state.stem_volumes.get("vocals", 1.0)) if _vca else 1.0
+
     any_solo = any(state.stem_solo.get(k, False)
                    for k in list(stems_now.keys()) +
                             ["front_vocals", "bg_vocals", "hidden_layer",
@@ -3983,6 +4916,18 @@ def mix(start, frames):
                              "instrumental"])
 
     def _audible(key):
+        if _vca:
+            if key == "vocals":
+                return False              # silent: it is only a control now
+            if key in ("front_vocals", "bg_vocals"):
+                # VOCALS' own mute is deliberately not passed on: each half
+                # has its own M button for that. Its fader and solo still
+                # act on both.
+                if any_solo:
+                    # Soloing VOCALS solos both halves.
+                    return bool(state.stem_solo.get(key, False)
+                                or state.stem_solo.get("vocals", False))
+                return not state.stem_mute.get(key, False)
         # Solo wins over that cell's own mute: soloing a muted cell is a
         # request to hear it, and the mute comes back when solo is released.
         if any_solo:
@@ -4030,6 +4975,8 @@ def mix(start, frames):
             state._meter_levels[name] = (0.0, 0.0)
             continue
         chunk = _raw_eq_chunks[name].copy()
+        if state.stem_invert.get(name, False):
+            chunk = -chunk
         if name == "vocals" and state.vff_enabled:
             chunk = apply_vff(chunk)
         chunk = apply_debleed(chunk, name, _raw_eq_chunks, sr_int)
@@ -4074,6 +5021,8 @@ def mix(start, frames):
         ch = data[s:e].copy() if e <= buf_len else np.concatenate([data[s:], data[:e - buf_len]])
         if len(ch) < frames:
             ch = np.pad(ch, ((0, frames - len(ch)), (0, 0)))
+        if state.stem_invert.get(key, False):
+            ch = -ch
         ch = apply_eq(ch, state.sr, state.eq_bands.get(key, [0] * 5), stem_key=key)
         if vff_fn is not None:
             ch = vff_fn(ch)
@@ -4099,9 +5048,9 @@ def mix(start, frames):
         out.__iadd__(scaled)
 
     # Imported stems — fv/bgv/hl carry optional VFF; synth/strings/fx do not.
-    _mix_import(state.fv_data,         state.fv_volume,         "front_vocals",
+    _mix_import(state.fv_data,         state.fv_volume * _vca_vol, "front_vocals",
                 vff_fn=apply_fv_vff  if state.fv_vff_enabled  else None)
-    _mix_import(state.bg_vocals_data,  state.bg_vocals_volume,  "bg_vocals",
+    _mix_import(state.bg_vocals_data,  state.bg_vocals_volume * _vca_vol, "bg_vocals",
                 vff_fn=apply_bgv_vff if state.bgv_vff_enabled else None)
     _mix_import(state.hl_data,         state.hl_volume,         "hidden_layer",
                 vff_fn=apply_hl_vff  if state.hl_vff_enabled  else None)
@@ -4230,6 +5179,11 @@ def load_file():
                 app.after(0, lambda: _paint_ms("instrumental"))
             separate_inst(path, cancel=cancel, ui_progress=True)
             return
+        # LOAD FIRST: the strings model runs on the track itself, so it can
+        # go before the six-stem pass and fill its cell that much sooner.
+        if (_STR_AUTO and _STR_FIRST and not cancel.is_set()
+                and strings_model is not None):
+            separate_strings(path, cancel=cancel)
         if _INST_AUTO and _INST_CONCURRENT:
             t_inst = threading.Thread(target=_run_low_priority, args=(separate_inst, path),
                                       kwargs={"cancel": cancel}, daemon=True)
@@ -4244,12 +5198,50 @@ def load_file():
             separate(path, cancel=cancel)
             if _INST_AUTO and not cancel.is_set():
                 separate_inst(path, cancel=cancel)
+        # The vocal chain and the strings chain, in parallel.
+        _run_post_stem_chains(path, cancel)
+    _start_load(path, _load_job)
+
+
+def report_split_result():
+    """Say plainly what the two vocal cells ended up with."""
+    def _describe(name, data):
+        if data is None:
+            return f"{name}: empty"
+        return f"{name}: {len(data) / max(1, int(state.sr or 44100)):.1f}s at " \
+               f"{_rms_db(data):.1f} dB"
+    print(f"[Karaoke] Result — {_describe('FRT VOX', state.fv_data)}, "
+          f"{_describe('BG VOX', state.bg_vocals_data)}")
+
+
+def _run_post_stem_chains(path, cancel):
+    """The two chains that follow the six-stem pass, side by side.
+
+    Chain 1  main track -> vocals model -> VOCALS, then karaoke -> FRT + BG
+    Chain 2  OTHER stem -> strings model -> STRINGS, OTHER keeps the rest
+
+    They are independent of each other, so they run on two threads; the GPU
+    serialises the actual passes, but neither has to wait for the other's
+    file reading, resampling or overlap-add.
+    """
+    def _vocal_chain():
+        if _VOC_AUTO and not cancel.is_set() and vocals_model is not None:
+            refine_vocals(path, cancel=cancel)
         if not cancel.is_set():
             separate_bg_vocals(cancel=cancel)
-        # Bowed strings, from gilliaan's model, into the STRINGS cell.
-        if _STR_AUTO and not cancel.is_set() and strings_model is not None:
-            separate_strings(path, cancel=cancel)
-    _start_load(path, _load_job)
+            report_split_result()
+
+    def _strings_chain():
+        if (_STR_AUTO and not _STR_FIRST and not cancel.is_set()
+                and strings_model is not None):
+            separate_strings(cancel=cancel)
+
+    threads = [threading.Thread(target=_vocal_chain, daemon=True),
+               threading.Thread(target=_strings_chain, daemon=True)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 def load_file_path(path):
@@ -4291,6 +5283,11 @@ def load_file_path(path):
                 app.after(0, lambda: _paint_ms("instrumental"))
             separate_inst(path, cancel=cancel, ui_progress=True)
             return
+        # LOAD FIRST: the strings model runs on the track itself, so it can
+        # go before the six-stem pass and fill its cell that much sooner.
+        if (_STR_AUTO and _STR_FIRST and not cancel.is_set()
+                and strings_model is not None):
+            separate_strings(path, cancel=cancel)
         if _INST_AUTO and _INST_CONCURRENT:
             t_inst = threading.Thread(target=_run_low_priority, args=(separate_inst, path),
                                       kwargs={"cancel": cancel}, daemon=True)
@@ -4310,11 +5307,8 @@ def load_file_path(path):
             if _INST_AUTO and not cancel.is_set():
                 separate_inst(path, cancel=cancel)
         # BG VOX comes from the karaoke model, not from a file.
-        if not cancel.is_set():
-            separate_bg_vocals(cancel=cancel)
-        # Bowed strings, from gilliaan's model, into the STRINGS cell.
-        if _STR_AUTO and not cancel.is_set() and strings_model is not None:
-            separate_strings(path, cancel=cancel)
+        # The vocal chain and the strings chain, in parallel.
+        _run_post_stem_chains(path, cancel)
 
     _start_load(path, _load_job_inner)
 
@@ -4336,8 +5330,31 @@ _fg_cv      = threading.Condition()
 _fg_running = 0
 
 
-def _fg_enter():
+# Only one separation pass runs at a time. The chains are still started in
+# parallel — they just queue for their turn here instead of fighting over
+# the GPU, which made all of them crawl and left three cells sitting at
+# "separating" together.
+_pass_lock = threading.Lock()
+
+
+def _pass_acquire(tag="pass"):
+    """Wait for whatever is separating now to finish."""
+    if _pass_lock.acquire(blocking=False):
+        return
+    print(f"[Queue] {tag}: waiting for the current separation to finish")
+    _pass_lock.acquire()
+
+
+def _pass_release():
+    try:
+        _pass_lock.release()
+    except RuntimeError:
+        pass          # never acquired on this path
+
+
+def _fg_enter(tag="pass"):
     global _fg_running
+    _pass_acquire(tag)
     with _fg_cv:
         _fg_running += 1
 
@@ -4357,6 +5374,7 @@ def _fg_leave():
         _fg_running = max(0, _fg_running - 1)
         _fg_cv.notify_all()
     _release_vram()
+    _pass_release()
 
 
 def _bg_wait_for_foreground(cancel=None, timeout=600.0):
@@ -4405,17 +5423,31 @@ def _reset_pass_flags():
     beginning with no job alive is proof that nothing is running, so it is a
     safe moment to clear them.
     """
-    global _inst_separating, _kara_separating
+    global _inst_separating, _kara_separating, _strings_separating
+    global _vocals_refining
     old = _load_thread[0]
     if old is not None and old.is_alive():
         return
-    if _inst_separating or _kara_separating:
+    if (_inst_separating or _kara_separating or _strings_separating
+            or _vocals_refining):
         print("[Load] Clearing stale pass flags")
     _inst_separating = False
     _kara_separating = False
+    _strings_separating = False
+    _vocals_refining = False
     with _fg_cv:
         globals()["_fg_running"] = 0
         _fg_cv.notify_all()
+    # And the one-pass-at-a-time lock: if a pass died without releasing it,
+    # every later pass would wait on it for ever and the cells would just
+    # stay empty with nothing said.
+    if _pass_lock.locked():
+        print("[Load] Releasing the separation lock left behind by a "
+              "previous pass")
+        try:
+            _pass_lock.release()
+        except RuntimeError:
+            pass
 
 
 def _clear_solos():
@@ -4447,13 +5479,19 @@ def _unload_track_extras():
     the halves were carrying the vocal, and the new track's split has not
     happened yet.
     """
+    state.vocals_refined = False
+    state.vocals_is_vca = False
+    state.stem_invert.clear()
+    if running:
+        for _k in list(_invert_btns):
+            app.after(0, lambda k=_k: _paint_invert(k))
+    if running:
+        app.after(0, _show_vocals_cell)
+        app.after(0, _update_vocals_status)
     state.fv_data        = None
     state.bg_vocals_data = None
     state.strings_data   = None
     state.strings_is_quick = False
-    if _other_muted_by_strings[0]:
-        state.stem_mute["other"] = False
-        _other_muted_by_strings[0] = False
     state.instrumental   = None
     _halves_muted_by_vocals.clear()
     state.instrumental_is_quick = False
@@ -4722,7 +5760,7 @@ def separate(path, into=None, cancel=None):
             print("[BS-RoFormer] Pre-load cancelled")
             return
     else:
-        _fg_enter()
+        _fg_enter("six-stem")
     try:
         run_device  = device
         sr_i        = _MODEL_SR
@@ -4900,17 +5938,9 @@ def separate(path, into=None, cancel=None):
     # audio is in the stems the user corrected it to last time.
     _apply_saved_fixes()
 
-    # A stand-in for the STRINGS cell, until its own model has run.
-    if _STR_QUICK and state.strings_data is None:
-        _qs = _quick_strings(new_stems)
-        if _qs is not None:
-            with audio_lock:
-                state.strings_data = _qs
-                state.strings_sr   = _MODEL_SR
-                state.strings_is_quick = True
-            if running:
-                app.after(0, _swap_to_strings)
-                app.after(0, _update_strings_status_label)
+    # No stand-in for STRINGS any more: OTHER holds the strings until the
+    # model has run and taken them out, so copying OTHER into STRINGS would
+    # play the same material from both cells.
 
     # The INSTRUM cell can be filled right now from the stems, so it's usable
     # while the dedicated model pass is still running (or instead of it, when
@@ -7607,13 +8637,25 @@ mixer_grid.pack(fill="x", padx=10, pady=(0, 4))
 
 # The ATMOS bed sits on its own row beneath the stem cells: eighteen cells on
 # one row cannot be shown at a readable width without scrolling sideways.
+# ── ATMOS row, folded away by default ─────────────────────────────────────
+# Six cells plus their import bar is a lot of height for something most
+# tracks never use, so the row starts collapsed behind this header.
+_atmos_header_row = ctk.CTkFrame(mixer_outer, fg_color="transparent")
+_atmos_header_row.pack(fill="x", padx=10, pady=(0, 2))
+
+_atmos_open = [False]
+_atmos_toggle_btn = ctk.CTkButton(
+    _atmos_header_row, text="",
+    fg_color=STEEL, hover_color=STEEL_LIGHT, text_color=TEXT_MAIN,
+    font=FONT_LABEL, corner_radius=0, border_width=1,
+    border_color=BORDER, height=26)
+_atmos_toggle_btn.pack(fill="x")
+
 atmos_grid = ctk.CTkFrame(mixer_outer, fg_color="transparent")
-atmos_grid.pack(fill="x", padx=10, pady=(0, 2))
 
 # One file, six cells: load an E-AC-3 (including the streams used for Dolby
 # Atmos) or any multichannel file and its 5.1 bed is spread over the row.
 _atmos_bar = ctk.CTkFrame(mixer_outer, fg_color="transparent")
-_atmos_bar.pack(fill="x", padx=10, pady=(0, 8))
 
 ctk.CTkButton(_atmos_bar,
               text="⬡  IMPORT ATMOS BED  (E-AC-3 / 5.1 file)",
@@ -7635,9 +8677,75 @@ ctk.CTkLabel(_atmos_bar,
              text="FFmpeg decodes the 5.1 bed; Atmos height objects are not rendered",
              font=FONT_SMALL, text_color=TEXT_DIM).pack(side="left", padx=12)
 
+
+def _atmos_set_open(open_it):
+    """Show or hide the ATMOS row and its import bar together."""
+    _atmos_open[0] = bool(open_it)
+    if _atmos_open[0]:
+        atmos_grid.pack(fill="x", padx=10, pady=(0, 2),
+                        after=_atmos_header_row)
+        _atmos_bar.pack(fill="x", padx=10, pady=(0, 8), after=atmos_grid)
+        _atmos_toggle_btn.configure(text="▾  ATMOS BED  (5.1 — 6 cells)")
+    else:
+        atmos_grid.pack_forget()
+        _atmos_bar.pack_forget()
+        _atmos_toggle_btn.configure(text="▸  ATMOS BED  (5.1 — 6 cells)")
+    # The row changes the content height, so let the scroll area catch up.
+    try:
+        _schedule_sf_geometry(30)
+    except Exception:
+        pass
+
+
+_atmos_toggle_btn.configure(
+    command=lambda: _atmos_set_open(not _atmos_open[0]))
+_atmos_set_open(False)          # folded until asked for
+
 STEMS = ["vocals", "drums", "bass", "guitar", "piano", "other"]
 
 stem_sliders = {}   # name -> CTkSlider, so reset buttons can reach them
+_invert_btns = {}
+
+
+def _toggle_invert(key):
+    """Flip a cell's polarity."""
+    state.stem_invert[key] = not state.stem_invert.get(key, False)
+    _paint_invert(key)
+    print(f"[Mixer] {key}: phase {'inverted' if state.stem_invert[key] else 'normal'}")
+
+
+def _paint_invert(key):
+    btn = _invert_btns.get(key)
+    if btn is None:
+        return
+    on = state.stem_invert.get(key, False)
+    try:
+        btn.configure(fg_color="#7a3d00" if on else STEEL,
+                      hover_color="#a35200" if on else STEEL_LIGHT,
+                      text_color=BRIGHT_GREEN if on else TEXT_DIM,
+                      text="Ø PHASE  ON" if on else "Ø PHASE")
+    except Exception:
+        pass
+
+
+def _add_invert_button(cell, key, after=None):
+    """A polarity switch for one cell."""
+    btn = ctk.CTkButton(cell, text="Ø PHASE",
+                        command=lambda k=key: _toggle_invert(k),
+                        fg_color=STEEL, hover_color=STEEL_LIGHT,
+                        text_color=TEXT_DIM,
+                        font=("Courier New", 11, "bold"),
+                        corner_radius=0, border_width=1,
+                        border_color=BORDER, height=18)
+    if after is not None:
+        btn.pack(fill="x", padx=6, pady=(1, 0), after=after)
+    else:
+        btn.pack(fill="x", padx=6, pady=(1, 0))
+    _invert_btns[key] = btn
+    _paint_invert(key)
+    return btn
+
+
 def _paint_ms(key):
     """Colour a cell's M and S buttons from state.
 
@@ -8198,8 +9306,6 @@ for col_idx, name in enumerate(STEMS):
         def _cmd():
             _toggle_mute(n)
             _inst_muted_by_us.discard(n)
-            if n == "other" and state.strings_data is not None:
-                _other_toggled()
             if n == "vocals":
                 if _split_halves_exist():
                     # The split halves are the alternative to this stem, so
@@ -8234,13 +9340,21 @@ for col_idx, name in enumerate(STEMS):
 
     _mute_btns[name] = _mb
     _solo_btns[name] = _sb
+    if name == "vocals":
+        _vocals_cell = cell          # needed for the refinement indicator
+    if name == "other":
+        _other_cell = cell           # needed for its phase button
+        _vocals_hdr_ref = [_hdr]     # the indicator sits under the header
 
     # Sub-label, in the same place and style as the model credits on the
     # INST, FRT VOX and BG VOX cells.
-    ctk.CTkLabel(cell, text="To be improved",
-                 font=("Courier New", 13, "bold"),
-                 text_color=BRIGHT_GREEN,
-                 wraplength=140, justify="center").pack(pady=(3, 0), fill="x")
+    _sub_lbl = ctk.CTkLabel(cell, text="To be improved",
+                            font=("Courier New", 13, "bold"),
+                            text_color=BRIGHT_GREEN,
+                            wraplength=140, justify="center")
+    _sub_lbl.pack(pady=(3, 0), fill="x")
+    if name == "vocals":
+        _vocals_sub_ref = [_sub_lbl]   # the model row is packed under this
 
     # ── Volume slider ────────────────────────────────────────────────────
     def _make_vol_cmd(n):
@@ -8368,7 +9482,7 @@ def _fv_mute():
     # Bringing a vocal half in takes over from the full VOCALS stem, so the
     # two never play together. (Muting a half leaves VOCALS as it is — you
     # may well want all the vocals silent.)
-    if _split_vocals_active():
+    if _split_vocals_active() and not getattr(state, "vocals_is_vca", False):
         state.stem_mute["vocals"] = True
         _paint_ms("vocals")
 def _fv_solo():
@@ -8421,9 +9535,10 @@ fv_import_btn = ctk.CTkButton(
 )
 fv_import_btn.pack(fill="x", padx=6, pady=(0, 4))
 # Sub-label: karaoke model credit, in the same form as the INST cell's.
-ctk.CTkLabel(fv_cell, text=_KARA_TITLE,
+_kara_title_fv_cell = ctk.CTkLabel(fv_cell, text=_KARA_TITLE,
              font=("Courier New", 11), text_color=STEEL_LIGHT,
-             wraplength=140, justify="center").pack(pady=(2, 0), fill="x")
+             wraplength=140, justify="center")
+_kara_title_fv_cell.pack(pady=(2, 0), fill="x")
 # "by" stays in the dim credit colour; the name itself is picked out.
 _kara_credit_row_fv_cell = ctk.CTkFrame(fv_cell, fg_color="transparent")
 _kara_credit_row_fv_cell.pack()
@@ -8431,9 +9546,17 @@ _kby_fv_cell, _, _kwho_fv_cell = _KARA_CREDIT.partition(" ")
 ctk.CTkLabel(_kara_credit_row_fv_cell, text=_kby_fv_cell + " ",
              font=("Courier New", 11), text_color=TEXT_DIM
              ).pack(side="left")
-ctk.CTkLabel(_kara_credit_row_fv_cell, text=_kwho_fv_cell or _KARA_CREDIT,
-             font=("Courier New", 13, "bold"), text_color=BRIGHT_GREEN
-             ).pack(side="left")
+_kara_author_fv_cell = ctk.CTkLabel(
+    _kara_credit_row_fv_cell, text=_kwho_fv_cell or _KARA_CREDIT,
+    font=("Courier New", 13, "bold"), text_color=BRIGHT_GREEN)
+_kara_author_fv_cell.pack(side="left")
+_register_model_credit("karaoke", _kara_title_fv_cell, _kara_author_fv_cell)
+add_model_picker(fv_cell, "karaoke", after=_kara_credit_row_fv_cell)
+ctk.CTkButton(fv_cell, text="⇄ SWAP FRT/BG", command=swap_vocal_halves,
+              fg_color=STEEL, hover_color=STEEL_LIGHT, text_color=TEXT_DIM,
+              font=("Courier New", 11, "bold"), corner_radius=0,
+              border_width=1, border_color=BORDER, height=18
+              ).pack(fill="x", padx=6, pady=(1, 0))
 
 
 # Karaoke-split progress. One pass fills both cells, so both show the same
@@ -8548,7 +9671,7 @@ def _bgv_mute():
     # Bringing a vocal half in takes over from the full VOCALS stem, so the
     # two never play together. (Muting a half leaves VOCALS as it is — you
     # may well want all the vocals silent.)
-    if _split_vocals_active():
+    if _split_vocals_active() and not getattr(state, "vocals_is_vca", False):
         state.stem_mute["vocals"] = True
         _paint_ms("vocals")
 def _bgv_solo():
@@ -8616,9 +9739,10 @@ bgv_import_btn = ctk.CTkButton(
 )
 bgv_import_btn.pack(fill="x", padx=6, pady=(0, 4))
 # Sub-label: karaoke model credit, in the same form as the INST cell's.
-ctk.CTkLabel(bgv_cell, text=_KARA_TITLE,
+_kara_title_bgv_cell = ctk.CTkLabel(bgv_cell, text=_KARA_TITLE,
              font=("Courier New", 11), text_color=STEEL_LIGHT,
-             wraplength=140, justify="center").pack(pady=(2, 0), fill="x")
+             wraplength=140, justify="center")
+_kara_title_bgv_cell.pack(pady=(2, 0), fill="x")
 # "by" stays in the dim credit colour; the name itself is picked out.
 _kara_credit_row_bgv_cell = ctk.CTkFrame(bgv_cell, fg_color="transparent")
 _kara_credit_row_bgv_cell.pack()
@@ -8626,9 +9750,26 @@ _kby_bgv_cell, _, _kwho_bgv_cell = _KARA_CREDIT.partition(" ")
 ctk.CTkLabel(_kara_credit_row_bgv_cell, text=_kby_bgv_cell + " ",
              font=("Courier New", 11), text_color=TEXT_DIM
              ).pack(side="left")
-ctk.CTkLabel(_kara_credit_row_bgv_cell, text=_kwho_bgv_cell or _KARA_CREDIT,
-             font=("Courier New", 13, "bold"), text_color=BRIGHT_GREEN
-             ).pack(side="left")
+_kara_author_bgv_cell = ctk.CTkLabel(
+    _kara_credit_row_bgv_cell, text=_kwho_bgv_cell or _KARA_CREDIT,
+    font=("Courier New", 13, "bold"), text_color=BRIGHT_GREEN)
+_kara_author_bgv_cell.pack(side="left")
+_register_model_credit("karaoke", _kara_title_bgv_cell, _kara_author_bgv_cell)
+add_model_picker(bgv_cell, "karaoke", after=_kara_credit_row_bgv_cell)
+ctk.CTkButton(bgv_cell, text="⇄ SWAP FRT/BG", command=swap_vocal_halves,
+              fg_color=STEEL, hover_color=STEEL_LIGHT, text_color=TEXT_DIM,
+              font=("Courier New", 11, "bold"), corner_radius=0,
+              border_width=1, border_color=BORDER, height=18
+              ).pack(fill="x", padx=6, pady=(1, 0))
+
+_backing_src_btn = ctk.CTkButton(
+    bgv_cell,
+    text="BG: RESIDUE" if _KARA_BACKING_FROM_RESIDUE else "BG: MODEL",
+    command=toggle_backing_source,
+    fg_color=STEEL, hover_color=STEEL_LIGHT, text_color=TEXT_DIM,
+    font=("Courier New", 11, "bold"), corner_radius=0,
+    border_width=1, border_color=BORDER, height=18)
+_backing_src_btn.pack(fill="x", padx=6, pady=(1, 0))
 
 
 _bgv_prog_lbl = ctk.CTkLabel(bgv_cell, text="0%",
@@ -9102,7 +10243,6 @@ _strings_name_lbl = ctk.CTkLabel(_strings_hdr, text="STRINGS", anchor="center",
 
 def _strings_mute():
     _toggle_mute("strings")
-    _strings_toggled()
 
 
 def _strings_solo():
@@ -9127,17 +10267,19 @@ _mute_btns["strings"] = _strings_mb
 _solo_btns["strings"] = _strings_sb
 
 # The model's name and author, directly under the cell's own name.
-ctk.CTkLabel(_strings_cell, text=_STR_TITLE,
+_str_title_lbl = ctk.CTkLabel(_strings_cell, text=_STR_TITLE,
              font=("Courier New", 11), text_color=STEEL_LIGHT,
-             wraplength=140, justify="center").pack(pady=(2, 0), fill="x")
+             wraplength=140, justify="center")
+_str_title_lbl.pack(pady=(2, 0), fill="x")
 _str_credit_row = ctk.CTkFrame(_strings_cell, fg_color="transparent")
 _str_credit_row.pack()
 _sby, _, _swho = _STR_CREDIT.partition(" ")
 ctk.CTkLabel(_str_credit_row, text=_sby + " ",
              font=("Courier New", 11), text_color=TEXT_DIM).pack(side="left")
-ctk.CTkLabel(_str_credit_row, text=_swho or _STR_CREDIT,
-             font=("Courier New", 13, "bold"),
-             text_color=BRIGHT_GREEN).pack(side="left")
+_str_author_lbl = ctk.CTkLabel(_str_credit_row, text=_swho or _STR_CREDIT,
+             font=("Courier New", 13, "bold"), text_color=BRIGHT_GREEN)
+_str_author_lbl.pack(side="left")
+_register_model_credit("strings", _str_title_lbl, _str_author_lbl)
 
 # What the model is doing, worded as on the INST cell.
 _strings_status_lbl = ctk.CTkLabel(_strings_cell, text="WAITING",
@@ -9306,6 +10448,24 @@ ctk.CTkCheckBox(_strings_cell, text="AUTO SEPARATE",
                 ).pack(padx=6, pady=(2, 0))
 
 
+_strings_first_var = ctk.BooleanVar(value=_STR_FIRST)
+
+
+def _on_strings_first():
+    global _STR_FIRST
+    _STR_FIRST = _strings_first_var.get()
+    _update_strings_status_label()
+
+
+ctk.CTkCheckBox(_strings_cell, text="LOAD FIRST",
+                variable=_strings_first_var, command=_on_strings_first,
+                font=("Courier New", 11), text_color=TEXT_MAIN,
+                fg_color=RED, hover_color=BRIGHT_RED,
+                checkmark_color="#ffffff", corner_radius=0,
+                border_color=STEEL, checkbox_width=14, checkbox_height=14
+                ).pack(padx=6, pady=(0, 0))
+
+
 def _strings_separate_now():
     path = _playlist_current[0]
     if not path or state.separating or _strings_separating:
@@ -9464,9 +10624,10 @@ _mute_btns[_inst_key] = _d_mb
 _solo_btns[_inst_key] = _d_sb
 
 # Sub-label: instrumental model credit
-ctk.CTkLabel(_inst_cell, text=_INST_TITLE,
+_inst_title_lbl = ctk.CTkLabel(_inst_cell, text=_INST_TITLE,
              font=("Courier New", 11), text_color=STEEL_LIGHT,
-             wraplength=140, justify="center").pack(pady=(2, 0), fill="x")
+             wraplength=140, justify="center")
+_inst_title_lbl.pack(pady=(2, 0), fill="x")
 # "by" stays in the dim credit colour; the name itself is picked out.
 _inst_credit_row = ctk.CTkFrame(_inst_cell, fg_color="transparent")
 _inst_credit_row.pack()
@@ -9474,9 +10635,10 @@ _by, _, _who = _INST_CREDIT.partition(" ")
 ctk.CTkLabel(_inst_credit_row, text=_by + " ",
              font=("Courier New", 11), text_color=TEXT_DIM
              ).pack(side="left")
-ctk.CTkLabel(_inst_credit_row, text=_who or _INST_CREDIT,
-             font=("Courier New", 13, "bold"), text_color=BRIGHT_GREEN
-             ).pack(side="left")
+_inst_author_lbl = ctk.CTkLabel(_inst_credit_row, text=_who or _INST_CREDIT,
+             font=("Courier New", 13, "bold"), text_color=BRIGHT_GREEN)
+_inst_author_lbl.pack(side="left")
+_register_model_credit("instrumental", _inst_title_lbl, _inst_author_lbl)
 
 # Status pill — updated by _update_inst_status_label()
 _inst_status_lbl = ctk.CTkLabel(_inst_cell, text="WAITING",
@@ -10847,6 +12009,136 @@ def _make_collapsible(panel, title_lbl, title_text, start_open=True):
     return _toggle
 
 
+# ── VOCALS cell: progress for the dedicated vocals model ──────────────────
+# The six-stem vocals are usable straight away; this says that a better
+# version is on its way, and shows how far along it is.
+_vocals_status_lbl = ctk.CTkLabel(_vocals_cell, text="",
+                                  font=("Courier New", 10, "bold"),
+                                  text_color=TEXT_DIM)
+_vocals_prog_row = ctk.CTkFrame(_vocals_cell, fg_color="transparent")
+_vocals_prog_bar = ctk.CTkProgressBar(_vocals_prog_row, progress_color=GLOW_RED,
+                                      fg_color=PANEL, corner_radius=0, height=5)
+_vocals_prog_bar.set(0)
+_vocals_prog_bar.pack(fill="x", padx=2)
+_vocals_prog_lbl = ctk.CTkLabel(_vocals_prog_row, text="0%",
+                                font=("Courier New", 13, "bold"),
+                                text_color=GLOW_RED)
+_vocals_prog_lbl.pack()
+
+
+def _vocals_status_tick():
+    """Keep the VOCALS cell's line current.
+
+    It was only refreshed from inside the refinement pass, so with no vocals
+    model installed — or before one had run — the line never appeared.
+    """
+    try:
+        _update_vocals_status()
+    except Exception:
+        pass
+    if running:
+        app.after(500, _vocals_status_tick)
+
+
+# Pick the vocals model by hand when the name-based search picks wrongly.
+# The VOCALS cell carries no model name or credit: the stem it shows comes
+# from the six-stem model first and the vocals model later, so naming one of
+# them would be wrong half the time.
+_voc_model_wrap = _vocals_sub_ref[0] if _vocals_sub_ref[0] is not None \
+    else _vocals_hdr_ref[0]
+
+
+def _update_vocals_status():
+    """Say whether these are the rough vocals or the refined ones."""
+    try:
+        if getattr(state, "vocals_is_vca", False):
+            _vocals_status_lbl.configure(text="VCA → FRT + BG",
+                                         text_color=BRIGHT_GREEN)
+        elif _vocals_refining:
+            _vocals_status_lbl.configure(text="REFINING VOCALS…",
+                                         text_color="#ffaa00")
+        elif getattr(state, "vocals_refined", False):
+            _vocals_status_lbl.configure(text="REFINED", text_color=BRIGHT_GREEN)
+        elif state.stems:
+            _vocals_status_lbl.configure(text="QUICK (6-STEM)",
+                                         text_color=TEXT_DIM)
+        else:
+            _vocals_status_lbl.configure(text="")
+        if _vocals_status_lbl.cget("text") and not _vocals_status_lbl.winfo_ismapped():
+            _vocals_status_lbl.pack(after=_voc_model_wrap, pady=(1, 0))
+        elif not _vocals_status_lbl.cget("text"):
+            _vocals_status_lbl.pack_forget()
+    except Exception:
+        pass
+
+
+def _set_vocals_progress(frac):
+    try:
+        if not _vocals_prog_row.winfo_ismapped():
+            _vocals_prog_row.pack(fill="x", padx=6, pady=(1, 0),
+                                  after=_vocals_status_lbl)
+        _vocals_prog_bar.set(max(0.0, min(1.0, frac)))
+        _vocals_prog_lbl.configure(text=f"{int(round(frac * 100))}%")
+    except Exception:
+        pass
+
+
+def _clear_vocals_progress():
+    try:
+        _vocals_prog_bar.set(0)
+        _vocals_prog_lbl.configure(text="0%")
+        _vocals_prog_row.pack_forget()
+    except Exception:
+        pass
+
+
+# ── The VOCALS cell steps aside once the split has replaced it ────────────
+def _hide_vocals_cell():
+    """Take VOCALS out of the mixer: FRT VOX and BG VOX hold it now.
+
+    Leaving it in place means the same singing plays from three cells at
+    once, which is both louder than it should be and confusing.
+    """
+    try:
+        if _vocals_cell.winfo_ismapped():
+            _vocals_cell.grid_remove()
+            print("[Mixer] VOCALS replaced by FRT VOX + BG VOX")
+    except Exception:
+        pass
+
+
+def _show_vocals_cell():
+    try:
+        if not _vocals_cell.winfo_ismapped():
+            _vocals_cell.grid()
+    except Exception:
+        pass
+
+
+def report_model_files():
+    """Print the file each model role resolved to, so a miss is visible."""
+    print("[Models] Files found in the models folder:")
+    for role, finder in (("vocals",       _voc_find_files),
+                         ("karaoke",      _kara_find_files),
+                         ("instrumental", _inst_find_files),
+                         ("strings",      _str_find_files)):
+        try:
+            ckpt = finder()[0]
+        except Exception:
+            ckpt = ""
+        name = os.path.basename(ckpt) if ckpt else "— none found —"
+        print(f"[Models]   {role:13} {name}")
+
+
+report_model_files()
+
+# No polarity switches: OTHER has the strings taken out of it automatically
+# once gilliaan's model has run, so the two cells no longer share material
+# and there is nothing to cancel.
+
+# Credit whichever model each cell is actually going to load.
+sync_model_credits()
+
 # Paint every M/S button from state once, so the first frame shows exactly
 # what the mixer will do (some cells start muted).
 _paint_all_ms()
@@ -10867,6 +12159,7 @@ if _UPDATE_CHECK and _UPDATE_REPO:
     threading.Thread(target=lambda: check_for_update(quiet=True),
                      daemon=True).start()
 app.after(1200, _fix_watch_loop)
+app.after(1000, _vocals_status_tick)   # keeps the VOCALS line up to date
 
 app.after(800, _fit_loop)   # keep every label and button inside its space
 app.bind("<Configure>", _fit_after_resize, add="+")

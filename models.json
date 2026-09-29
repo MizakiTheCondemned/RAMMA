@@ -35,6 +35,48 @@
       "note": "its config"
     },
     {
+      "name": "mel_band_roformer_vocals_becruily.ckpt",
+      "url": "https://huggingface.co/becruily/mel-band-roformer-vocals/blob/main/mel_band_roformer_vocals_becruily.ckpt",
+      "sha256": "",
+      "required": false,
+      "note": "vocal model"
+    },
+    {
+      "name": "config_vocals_becruily.yaml",
+      "url": "https://huggingface.co/becruily/mel-band-roformer-vocals/blob/main/config_vocals_becruily.yaml",
+      "sha256": "",
+      "required": false,
+      "note": "its config"
+    },
+    {
+      "name": "mel_band_roformer_karaoke_becruily.ckpt",
+      "url": "https://huggingface.co/becruily/mel-band-roformer-karaoke/blob/main/mel_band_roformer_karaoke_becruily.ckpt",
+      "sha256": "",
+      "required": false,
+      "note": "vocal / backing split"
+    },
+    {
+      "name": "config_karaoke_becruily.yaml",
+      "url": "https://huggingface.co/becruily/mel-band-roformer-karaoke/blob/main/config_karaoke_becruily.yaml",
+      "sha256": "",
+      "required": false,
+      "note": "its config"
+    },
+    {
+      "name": "small_karaoke_gaboxaufr.ckpt",
+      "url": "https://huggingface.co/GaboxR67/MelBandRoformers/blob/main/melbandroformers/karaoke/small_karaoke_gaboxaufr.ckpt",
+      "sha256": "",
+      "required": false,
+      "note": "vocal model"
+    },
+    {
+      "name": "cconfig_karaoke_small.yaml",
+      "url": "https://huggingface.co/GaboxR67/MelBandRoformers/blob/main/melbandroformers/karaoke/config_karaoke_small.yaml",
+      "sha256": "",
+      "required": false,
+      "note": "its config"
+    },
+    {
       "name": "bsroformer_bowedstrings_v2.ckpt",
       "url": "https://huggingface.co/gilliaan/Stem-Separation-Models/resolve/main/BowedStrings/BandSplitRoformer/gilliaan_bsroformer_bowedstrings_v2.ckpt",
       "sha256": "",
@@ -44,20 +86,6 @@
     {
       "name": "bsroformer_bowedstrings_v2.yaml",
       "url": "https://huggingface.co/gilliaan/Stem-Separation-Models/resolve/main/BowedStrings/BandSplitRoformer/gilliaan_bsroformer_bowedstrings_v2.yaml",
-      "sha256": "",
-      "required": false,
-      "note": "bowed strings model"
-    },
-    {
-      "name": "mel_band_roformer_karaoke_becruily.ckpt",
-      "url": "https://huggingface.co/becruily/mel-band-roformer-karaoke/resolve/main/mel_band_roformer_karaoke_becruily.ckpt",
-      "sha256": "",
-      "required": false,
-      "note": "lead / backing vocal split"
-    },
-    {
-      "name": "config_karaoke_becruily.yaml",
-      "url": "https://huggingface.co/becruily/mel-band-roformer-karaoke/resolve/main/config_karaoke_becruily.yaml",
       "sha256": "",
       "required": false,
       "note": "its config"
