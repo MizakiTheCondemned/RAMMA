@@ -202,7 +202,7 @@ class LockedSlider(ctk.CTkSlider):
 
 
 app = ctk.CTk()
-app.title("R·A·M·M·A - STEM ENGINE v0.667")
+app.title("R·A·M·M·A - STEM ENGINE v0.667.1")
 app.configure(fg_color=BG)
 app.resizable(True, True)
 
@@ -328,7 +328,7 @@ _sp_bar_fill = tk.Frame(_sp_bar_bg, bg=RED)
 _sp_bar_fill.place(x=1, y=1, width=0, height=12)
 
 # Animated byline — cycles red → purple → gold
-_sp_byline = tk.Label(_sp_inner, text="Program made by: Sai & Eidii with help from megy, Denchik Games, Maggot, deton24 and trexmus - Models by: becruily, jarredou & unwa",
+_sp_byline = tk.Label(_sp_inner, text="Program made by: Sai & Eidii with help from megy, Denchik Games, Maggot, deton24 and trexmus - Models by: becruily, gabox, jarredou & unwa",
                        font=("Courier New", 11, "bold"),
                        fg=GLOW_RED, bg=BG)
 # Long credits: prefer wrapping onto a second line over shrinking the type
@@ -1193,9 +1193,20 @@ def add_model_picker(cell, role, after=None):
 # is kept as a backup, so a bad or truncated download cannot leave you
 # without a working program.
 # ============================================================
-_UPDATE_REPO   = ""            # "user/repo" — set this to switch updates on
+_UPDATE_REPO   = "MizakiTheCondemned/RAMMA"            # "user/repo" — set this to switch updates on
 _UPDATE_BRANCH = "main"
 _UPDATE_FILE   = "ramma.py"    # the file in the repo to track
+# Every file to keep up to date. Each entry is a path inside the repository;
+# it is installed at the same path beside ramma.py. When the repository
+# layout differs from yours, give the pair instead:
+#     ("src/ramma.py", "ramma.py")        repo path -> local path
+# Files that do not exist locally yet are simply added.
+_UPDATE_FILES  = [
+    "ramma.py",
+    # "requirements.txt",
+    # "RAMMA.bat",
+    "models.json",
+]
 _UPDATE_CHECK  = True          # look for updates at start-up
 _UPDATE_ASK    = True          # ask before installing; False installs quietly
 _UPDATE_STATE  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1243,19 +1254,91 @@ def _github_commit_info():
     return "", ""
 
 
-def _download_update():
-    """Fetch the tracked file from the branch; returns its text."""
+def _download_update(repo_path=None):
+    """Fetch one file from the branch; returns its text."""
+    return _download_bytes(repo_path or _UPDATE_FILE).decode("utf-8")
+
+
+def _download_bytes(repo_path):
+    """Fetch one file from the branch, as raw bytes."""
     import urllib.request
     url = (f"https://raw.githubusercontent.com/{_UPDATE_REPO}/"
-           f"{_UPDATE_BRANCH}/{_UPDATE_FILE}")
+           f"{_UPDATE_BRANCH}/{repo_path}")
     req = urllib.request.Request(url, headers={"User-Agent": "RAMMA"})
     with urllib.request.urlopen(req, timeout=60) as resp:
-        return resp.read().decode("utf-8")
+        return resp.read()
+
+
+def _update_targets():
+    """[(repo path, absolute local path), ...] for everything tracked."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    entries = list(_UPDATE_FILES) or [_UPDATE_FILE]
+    out = []
+    for e in entries:
+        if isinstance(e, (tuple, list)) and len(e) == 2:
+            repo_path, local = e
+        else:
+            repo_path = local = str(e)
+        if os.path.basename(str(local)) == os.path.basename(__file__) and \
+                os.path.dirname(str(local)) in ("", "."):
+            local_abs = os.path.abspath(__file__)     # the running file
+        else:
+            local_abs = os.path.join(here, str(local))
+        out.append((str(repo_path), local_abs))
+    return out
+
+
+def _bytes_hash(data):
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
 
 
 def _text_hash(text):
     import hashlib
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def install_files(changed):
+    """Install several downloaded files together, or none of them.
+
+    Every file is checked before anything is written — Python files must
+    compile, and ramma.py itself must not be suspiciously small — so a bad
+    download cannot leave you with half an update. Each file that is
+    replaced keeps its previous version as <name>.bak.
+    """
+    me = os.path.abspath(__file__)
+    for repo_path, local, data in changed:
+        if local.lower().endswith(".py"):
+            try:
+                compile(data.decode("utf-8"), local, "exec")
+            except (SyntaxError, UnicodeDecodeError) as e:
+                print(f"[Update] {repo_path} does not compile ({e}) — "
+                      f"nothing has been installed.")
+                return False
+        if os.path.abspath(local) == me and len(data) < 10000:
+            print(f"[Update] {repo_path} is only {len(data)} bytes — looks "
+                  f"truncated; nothing has been installed.")
+            return False
+
+    written = []
+    try:
+        for repo_path, local, data in changed:
+            os.makedirs(os.path.dirname(local) or ".", exist_ok=True)
+            if os.path.exists(local):
+                shutil.copy2(local, local + ".bak")
+            with open(local, "wb") as f:
+                f.write(data)
+            written.append(repo_path)
+    except Exception as e:
+        print(f"[Update] Stopped after {len(written)} file(s): {e}. The "
+              f"previous versions are in the .bak files beside them.")
+        return False
+
+    _save_update_state({"files": {rp: _bytes_hash(d) for rp, _l, d in changed},
+                        "installed": time.strftime("%Y-%m-%d %H:%M:%S")})
+    print(f"[Update] Installed {len(written)} file(s): {', '.join(written)}. "
+          f"Previous versions kept as .bak — restart RAMMA to use them.")
+    return True
 
 
 def install_update(new_hash, text):
@@ -1289,52 +1372,70 @@ def install_update(new_hash, text):
 
 
 def check_for_update(quiet=True):
-    """Compare this file with the one in the repository and offer the update.
+    """Compare every tracked file with the repository and offer the update.
 
     Contents are compared rather than commit ids: it needs only
     raw.githubusercontent.com, which has no rate limit for this, and it
-    answers the question that actually matters — is the published file
-    different from the one running?
+    answers the question that actually matters — is what is published
+    different from what is here?
     """
     if not _UPDATE_REPO:
         if not quiet:
             print("[Update] No repository set (_UPDATE_REPO near the top).")
         return None
-    try:
-        text = _download_update()
-    except Exception as e:
-        print(f"[Update] Could not reach GitHub: {e}")
-        return None
 
-    new_hash = _text_hash(text)
-    try:
-        with open(os.path.abspath(__file__), "r", encoding="utf-8") as f:
-            mine = _text_hash(f.read())
-    except Exception:
-        mine = ""
+    changed, missing = [], []
+    for repo_path, local in _update_targets():
+        try:
+            data = _download_bytes(repo_path)
+        except Exception as e:
+            if getattr(e, "code", None) == 404:
+                missing.append(repo_path)
+            else:
+                print(f"[Update] Could not reach GitHub: {e}")
+                return None
+            continue
+        try:
+            with open(local, "rb") as f:
+                mine = f.read()
+        except FileNotFoundError:
+            mine = None
+        # Compare ignoring line-ending differences, so a checkout with
+        # Windows line endings is not seen as a different version.
+        norm = lambda b: b.replace(b"\r\n", b"\n") if b is not None else None
+        if norm(data) != norm(mine):
+            changed.append((repo_path, local, data))
 
-    if new_hash == mine:
-        _save_update_state({"hash": new_hash, "checked": time.strftime("%Y-%m-%d %H:%M:%S")})
-        if not quiet:
+    if missing:
+        print(f"[Update] GitHub has no file at "
+              f"{', '.join(f'{_UPDATE_REPO}/{_UPDATE_BRANCH}/{m}' for m in missing)}. "
+              f"Check the repo name, branch and file paths, and that the "
+              f"repository is public — private ones cannot be read without "
+              f"signing in.")
+    if not changed:
+        if not missing and not quiet:
             print("[Update] Already up to date.")
         return False
-    if _update_state().get("skipped") == new_hash:
+
+    combined = _bytes_hash(b"".join(d for _rp, _l, d in changed))
+    if _update_state().get("skipped") == combined:
         if not quiet:
             print("[Update] A newer version is available but was skipped.")
         return False
 
+    names = [rp for rp, _l, _d in changed]
     date, message = _github_commit_info()
-    print(f"[Update] A different version is on GitHub "
-          f"({len(text)} bytes, {new_hash[:8]})"
-          + (f" — {message} ({date})" if message else ""))
+    print(f"[Update] {len(changed)} file(s) differ from GitHub: "
+          f"{', '.join(names)}" + (f" — {message} ({date})" if message else ""))
 
     def _proceed():
-        if install_update(new_hash, text) and running:
+        if install_files(changed) and running:
             try:
                 messagebox.showinfo(
                     "RAMMA updated",
-                    "RAMMA has been updated.\n\nRestart it to use the new "
-                    "version.\nThe previous one was kept as ramma.py.bak.")
+                    "Updated:\n  " + "\n  ".join(names) +
+                    "\n\nRestart RAMMA to use the new version.\n"
+                    "Previous versions were kept as .bak files.")
             except Exception:
                 pass
 
@@ -1346,14 +1447,15 @@ def check_for_update(quiet=True):
             try:
                 if messagebox.askyesno(
                         "RAMMA — update available",
-                        "A newer version of RAMMA is on GitHub.\n\n"
+                        "Newer versions of these files are on GitHub:\n  "
+                        + "\n  ".join(names) + "\n\n"
                         + (f"{message}\n({date})\n\n" if message else "")
-                        + "Install it now?\nYour current file is kept as "
-                          "ramma.py.bak."):
+                        + "Install them now?\nYour current files are kept "
+                          "as .bak."):
                     threading.Thread(target=_proceed, daemon=True).start()
                 else:
                     st = _update_state()
-                    st["skipped"] = new_hash
+                    st["skipped"] = combined
                     _save_update_state(st)
             except Exception:
                 pass
@@ -7779,7 +7881,7 @@ header.pack(fill="x", padx=0, pady=0)
 header.pack_propagate(False)
 
 ctk.CTkLabel(header,
-             text="R · A · M · M · A  ──  STEM  ENGINE  v0.667",
+             text="R · A · M · M · A  ──  STEM  ENGINE  v0.667.1",
              font=("Courier New", 14, "bold"),
              text_color=GLOW_RED).pack(side="left", padx=20)
 
@@ -12155,8 +12257,20 @@ _load_stem_fixes()          # fixes saved from previous sessions
 
 # Look for a newer ramma.py on GitHub, in the background so a slow or
 # unreachable network never delays start-up.
-if _UPDATE_CHECK and _UPDATE_REPO:
-    threading.Thread(target=lambda: check_for_update(quiet=True),
+# Always say what the updater is doing: a check that is disabled, finds
+# nothing new, or fails used to look exactly the same — silence.
+if not _UPDATE_CHECK:
+    print("[Update] Checking at start-up is off (_UPDATE_CHECK = False)")
+elif not _UPDATE_REPO:
+    print("[Update] Disabled — set _UPDATE_REPO near the top of ramma.py "
+          "to your GitHub repository, e.g. \"yourname/ramma\"")
+else:
+    _n = len(_update_targets())
+    print(f"[Update] Checking {_UPDATE_REPO} ({_UPDATE_BRANCH}) — "
+          f"{_n} file{'s' if _n != 1 else ''} — for newer versions…")
+    # quiet=False only means the outcome is printed to the console; the
+    # dialog still appears only when there is actually something to install.
+    threading.Thread(target=lambda: check_for_update(quiet=False),
                      daemon=True).start()
 app.after(1200, _fix_watch_loop)
 app.after(1000, _vocals_status_tick)   # keeps the VOCALS line up to date
