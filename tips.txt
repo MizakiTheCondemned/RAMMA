@@ -1,0 +1,25 @@
+Welcome to the tips window! 
+Here you will find some tips to help you get started!
+
+Looping:
+-
+You can loop a section of an audio file by right-clicking the waveform and dragging.
+To remove the looped section, simply right-click anywhere on the waveform.
+
+-
+
+Exporting Stems feature and Hyper-loading:
+-
+Exporting stems requires you to click "EXPORT FOLDER" first and foremost and then confirming the desired location of where you want to save your stems.
+
+After you have exported the stems to an audio file you can Hyper-load it.
+To Hyper-load an audio file, click on "LOCATE STEMS", then proceed to load an audio file that you already have the stems saved to.
+
+-
+
+The program has some hidden easter-eggs waiting to be found.
+It is only graphical changes, no new features or such things.
+
+More tips will be added in the future.
+
+- Sai

@@ -651,7 +651,7 @@ def _chunking_from_config(cfg, sr, fallback_chunk=None):
         except Exception:
             hop = 0
     if hop > 0:
-        samples = int(chunk_s * float(sr or 44100))
+        samples = int(round(chunk_s * float(sr or 44100)))
         snapped = (samples // hop) * hop
         if snapped >= hop and snapped != samples:
             print(f"[Chunking] {samples} samples is {samples / hop:.3f} STFT "
@@ -1187,6 +1187,58 @@ def add_model_picker(cell, role, after=None):
 
 
 # ============================================================
+# TIPS
+# A read-only window of tips, shown from the TIPS button. Editing needs the
+# editor passphrase. Only its SHA-256 hash is kept, on the line below, and it
+# is written there the first time you set one — so publishing ramma.py
+# publishes the lock, never the passphrase. The text lives in tips.txt
+# beside this file; list tips.txt in _UPDATE_FILES and your edits reach
+# everyone with the next update.
+# ============================================================
+_TIPS_EDITOR_HASH = "4b22cc2644f3e1c4889cef71fba9fcf2c7fe95ac5d827bff0f4556191a29c9c2"
+_TIPS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tips.txt")
+_TIPS_DEFAULT = ("No tips yet.\n\nThe author of this copy of RAMMA can add "
+                 "some with the EDIT button.")
+
+
+def _read_tips():
+    try:
+        with open(_TIPS_PATH, "r", encoding="utf-8") as f:
+            text = f.read()
+        return text if text.strip() else _TIPS_DEFAULT
+    except FileNotFoundError:
+        return _TIPS_DEFAULT
+    except Exception as e:
+        return f"The tips could not be read: {e}"
+
+
+def _write_tips(text):
+    with open(_TIPS_PATH, "w", encoding="utf-8") as f:
+        f.write(text.rstrip() + "\n")
+
+
+def _passphrase_hash(phrase):
+    import hashlib
+    return hashlib.sha256(("RAMMA-tips:" + phrase).encode("utf-8")).hexdigest()
+
+
+def _store_editor_hash(h):
+    """Write the hash into this file, so it travels with ramma.py."""
+    global _TIPS_EDITOR_HASH
+    me = os.path.abspath(__file__)
+    with open(me, "rb") as f:
+        data = f.read()
+    new = re.sub(rb'^_TIPS_EDITOR_HASH = "[0-9a-f]*"',
+                 b'_TIPS_EDITOR_HASH = "' + h.encode() + b'"',
+                 data, count=1, flags=re.MULTILINE)
+    if new == data:
+        raise RuntimeError("the _TIPS_EDITOR_HASH line was not found")
+    with open(me, "wb") as f:
+        f.write(new)
+    _TIPS_EDITOR_HASH = h
+
+
+# ============================================================
 # AUTO-UPDATE
 # Checks the GitHub repository for a newer ramma.py and offers to install it.
 # The new file is compiled before it replaces anything, and the running one
@@ -1206,6 +1258,7 @@ _UPDATE_FILES  = [
     # "requirements.txt",
     # "RAMMA.bat",
     "models.json",
+    # "tips.txt",     # uncomment once tips.txt is in your repository
 ]
 _UPDATE_CHECK  = True          # look for updates at start-up
 _UPDATE_ASK    = True          # ask before installing; False installs quietly
@@ -2868,8 +2921,8 @@ def separate_bg_vocals(into=None, cancel=None):
         run_device = device
         sr_i       = int(_kara_sr)
         n_samples  = len(audio)
-        chunk_n    = int(_kara_chunk_s * sr_i)
-        overlap_n  = int(globals().get("_kara_overlap_s", _OVERLAP_SECONDS) * sr_i)
+        chunk_n    = int(round(_kara_chunk_s * sr_i))
+        overlap_n  = int(round(globals().get("_kara_overlap_s", _OVERLAP_SECONDS) * sr_i))
         step_n     = chunk_n - 2 * overlap_n
 
         out_back = np.zeros((n_samples, 2), dtype=np.float32)
@@ -2916,7 +2969,7 @@ def separate_bg_vocals(into=None, cancel=None):
                     ci += len(batch_starts)
                     continue
                 try:
-                    x = torch.from_numpy(np.stack(chunks)).to(run_device)
+                    x = torch.from_numpy(_stack_padded(chunks, batch_n)).to(run_device)
                     with _amp_ctx(run_device, use_fp16):
                         out_t = kara_model(x)
                     if out_t.dim() == 4:
@@ -3275,8 +3328,8 @@ def refine_vocals(path, cancel=None):
         x_full = audio.T.astype(np.float32)
         n_samples = x_full.shape[1]
 
-        chunk_n   = int(_voc_chunk_s * sr_i)
-        overlap_n = int(_voc_overlap_s * sr_i)
+        chunk_n   = int(round(_voc_chunk_s * sr_i))
+        overlap_n = int(round(_voc_overlap_s * sr_i))
         step_n    = max(1, chunk_n - 2 * overlap_n)
         fade = np.ones(chunk_n, dtype=np.float32)
         if overlap_n > 0:
@@ -3307,7 +3360,7 @@ def refine_vocals(path, cancel=None):
                     chunks.append(seg)
                     kept.append(st_i)
                 try:
-                    xb = torch.from_numpy(np.ascontiguousarray(np.stack(chunks)))
+                    xb = torch.from_numpy(_stack_padded(chunks, batch_n))
                     xb = (xb.pin_memory().to(run_device, non_blocking=True)
                           if run_device.type == "cuda" else xb.to(run_device))
                     with _amp_ctx(run_device, use_fp16):
@@ -3402,8 +3455,8 @@ def separate_strings(path=None, cancel=None):
         x_full = audio.T.astype(np.float32)          # (2, N)
         n_samples = x_full.shape[1]
 
-        chunk_n   = int(_str_chunk_s * sr_i)
-        overlap_n = int(_str_overlap_s * sr_i)
+        chunk_n   = int(round(_str_chunk_s * sr_i))
+        overlap_n = int(round(_str_overlap_s * sr_i))
         step_n    = max(1, chunk_n - 2 * overlap_n)
         fade = np.ones(chunk_n, dtype=np.float32)
         if overlap_n > 0:
@@ -3436,7 +3489,7 @@ def separate_strings(path=None, cancel=None):
                     chunks.append(seg)
                     kept.append(st_i)
                 try:
-                    xb = torch.from_numpy(np.ascontiguousarray(np.stack(chunks)))
+                    xb = torch.from_numpy(_stack_padded(chunks, batch_n))
                     xb = (xb.pin_memory().to(run_device, non_blocking=True)
                           if run_device.type == "cuda" else xb.to(run_device))
                     with _amp_ctx(run_device, use_fp16):
@@ -3605,8 +3658,8 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
         # 2. Chunked overlap-add inference
         n_samples  = len(audio)
         sr_i       = model_sr
-        chunk_n    = int(_inst_chunk_s * sr_i)
-        overlap_n  = int(globals().get("_inst_overlap_s", _OVERLAP_SECONDS) * sr_i)
+        chunk_n    = int(round(_inst_chunk_s * sr_i))
+        overlap_n  = int(round(globals().get("_inst_overlap_s", _OVERLAP_SECONDS) * sr_i))
         step_n     = chunk_n - 2 * overlap_n
 
         out_inst = np.zeros((n_samples, 2), dtype=np.float32)
@@ -3658,7 +3711,7 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
 
                 try:
                     # Input: (B, 2, T)
-                    x = torch.from_numpy(np.stack(chunks)).to(run_device)
+                    x = torch.from_numpy(_stack_padded(chunks, batch_n)).to(run_device)
                     with _amp_ctx(run_device, use_fp16):
                         # Output: (B, num_stems, 2, T) for multi-stem models,
                         #         (B, 2, T) when the model has a single stem.
@@ -3920,6 +3973,7 @@ class AppState:
 
     # ── Bowed strings, from gilliaan's model ──────────────────────
     vocals_refined: bool             = False
+    saved_stems_dir: Optional[str]   = None    # set by LOCATE STEMS
     # Once the karaoke split has run, VOCALS carries no audio of its own:
     # its fader, M and S act on FRT VOX and BG VOX together.
     vocals_is_vca:  bool             = False
@@ -4027,6 +4081,7 @@ def _load_dirs():
         state.export_fmt_wav24   = bool(data.get("export_fmt_wav24", True))
         state.export_fmt_mp3     = bool(data.get("export_fmt_mp3",   False))
         state.export_fmt_mp3_256 = bool(data.get("export_fmt_mp3_256", False))
+        state.saved_stems_dir    = data.get("saved_stems_dir") or None
     except Exception:
         pass
 
@@ -4045,6 +4100,7 @@ def _save_dirs():
                 "export_fmt_wav24":   state.export_fmt_wav24,
                 "export_fmt_mp3":     state.export_fmt_mp3,
                 "export_fmt_mp3_256": state.export_fmt_mp3_256,
+                "saved_stems_dir":    state.saved_stems_dir,
             }, f, indent=2)
     except Exception as e:
         print("Could not save directory config:", e)
@@ -5359,25 +5415,28 @@ def load_file():
                 app.after(0, lambda: _paint_ms("instrumental"))
             separate_inst(path, cancel=cancel, ui_progress=True)
             return
+        # Saved stems first: whatever this song already has on disk is
+        # imported, and the passes it covers are skipped below.
+        import_saved_stems(path)
         # LOAD FIRST: the strings model runs on the track itself, so it can
         # go before the six-stem pass and fill its cell that much sooner.
         if (_STR_AUTO and _STR_FIRST and not cancel.is_set()
-                and strings_model is not None):
+                and strings_model is not None and "strings" not in _saved_cover):
             separate_strings(path, cancel=cancel)
         if _INST_AUTO and _INST_CONCURRENT:
-            t_inst = threading.Thread(target=_run_low_priority, args=(separate_inst, path),
+            t_inst = threading.Thread(target=_run_low_priority, args=(_inst_or_saved, path),
                                       kwargs={"cancel": cancel}, daemon=True)
             t_inst.start()
-            separate(path, cancel=cancel)
+            _six_or_saved(path, cancel=cancel)
             t_inst.join()
         elif _INST_AUTO and _INST_FIRST:
-            separate_inst(path, cancel=cancel)
+            _inst_or_saved(path, cancel=cancel)
             if not cancel.is_set():
-                separate(path, cancel=cancel)
+                _six_or_saved(path, cancel=cancel)
         else:
-            separate(path, cancel=cancel)
+            _six_or_saved(path, cancel=cancel)
             if _INST_AUTO and not cancel.is_set():
-                separate_inst(path, cancel=cancel)
+                _inst_or_saved(path, cancel=cancel)
         # The vocal chain and the strings chain, in parallel.
         _run_post_stem_chains(path, cancel)
     _start_load(path, _load_job)
@@ -5394,6 +5453,210 @@ def report_split_result():
           f"{_describe('BG VOX', state.bg_vocals_data)}")
 
 
+# ============================================================
+# SAVED STEMS
+# A song that has been separated and exported before need not be separated
+# again. Its stems are found by name — <song>_<cell>.wav, exactly what
+# EXPORT STEMS writes — and imported, and the passes they cover are skipped.
+# ============================================================
+_SAVED_STEM_KEYS = ("vocals", "drums", "bass", "guitar", "piano", "other",
+                    "instrumental", "front_vocals", "bg_vocals", "strings")
+_SIX = ("vocals", "drums", "bass", "guitar", "piano", "other")
+_saved_cover = set()     # what the current load took from saved files
+
+
+def _saved_stem_dirs(path):
+    """Folders searched for a song's saved stems, most specific first."""
+    song_dir = os.path.dirname(os.path.abspath(path))
+    base = os.path.splitext(os.path.basename(path))[0]
+    dirs = [state.saved_stems_dir,
+            os.path.join(song_dir, f"{base}_stems"),
+            state.export_folder,
+            song_dir]
+    out = []
+    for d in dirs:
+        if d and os.path.isdir(d) and os.path.abspath(d) not in out:
+            out.append(os.path.abspath(d))
+    return out
+
+
+def find_saved_stems(path):
+    """{cell key: file} for every saved stem of this song that can be found.
+
+    Loop exports (…_loop.wav) are partial and never used. With several
+    copies of one stem, a lossless file beats an MP3, then the newest wins.
+    """
+    base = os.path.splitext(os.path.basename(path))[0]
+    keys = "|".join(sorted(_SAVED_STEM_KEYS, key=len, reverse=True))
+    pat = re.compile(rf"^{re.escape(base)}_(?P<key>{keys})"
+                     rf"(?P<dup>[ _]\(?\d+\)?)?"
+                     rf"(?P<ext>\.wav|\.flac|_256k\.mp3|\.mp3)$",
+                     re.IGNORECASE)
+    found = {}
+    for d in _saved_stem_dirs(path):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            m = pat.match(name)
+            if not m:
+                continue
+            key = m.group("key").lower()
+            full = os.path.join(d, name)
+            lossless = m.group("ext").lower() in (".wav", ".flac")
+            rank = (lossless, os.path.getmtime(full))
+            if key not in found or rank > found[key][0]:
+                found[key] = (rank, full)
+    return {k: v[1] for k, v in found.items()}
+
+
+def _load_stem_file(f, length=None):
+    audio, file_sr = _read_audio_file(f)
+    audio = _resample_audio(np.asarray(audio, dtype=np.float32), file_sr)
+    if audio.ndim == 1:
+        audio = np.stack([audio, audio], axis=1)
+    if length is not None:
+        if len(audio) < length:
+            audio = np.pad(audio, ((0, length - len(audio)), (0, 0)))
+        elif len(audio) > length:
+            audio = audio[:length]
+    return np.ascontiguousarray(audio, dtype=np.float32)
+
+
+def import_saved_stems(path):
+    """Import whatever this song has saved, and note which passes it covers.
+
+    Returns the set of groups covered:
+      "stems"         all six six-stem cells — the six-stem pass is skipped
+      "instrumental"  the INST cell — its pass is skipped
+      "split"         both FRT VOX and BG VOX — the vocal chain is skipped
+      "strings"       the STRINGS cell — its pass is skipped
+    The six-stem model makes all six cells in one pass, so it is skipped
+    only when all six are saved; with some missing it runs as usual.
+    """
+    global _saved_cover
+    _saved_cover = set()
+    files = find_saved_stems(path)
+    if not files:
+        return _saved_cover
+    print(f"[Stems] Saved stems found for "
+          f"{os.path.splitext(os.path.basename(path))[0]!r}: "
+          f"{', '.join(sorted(files))}")
+    try:
+        loaded = {}
+        for key, f in files.items():
+            try:
+                loaded[key] = _load_stem_file(f)
+            except Exception as e:
+                print(f"[Stems]   {os.path.basename(f)} could not be read ({e}) "
+                      f"— that stem will be separated instead")
+        if not loaded:
+            return _saved_cover
+        length = max(len(a) for a in loaded.values())
+        for key in loaded:
+            loaded[key] = _load_stem_file(files[key], length)
+        sr = int(state.sr or 44100)
+
+        if all(k in loaded for k in _SIX):
+            new_stems = {k: loaded[k] for k in _STEM_KEYS if k in loaded}
+            _commit_saved_stems(new_stems)
+            _saved_cover.add("stems")
+        if "instrumental" in loaded:
+            with audio_lock:
+                state.instrumental = loaded["instrumental"]
+                state.instrumental_is_quick = False
+            _saved_cover.add("instrumental")
+        if "front_vocals" in loaded and "bg_vocals" in loaded:
+            with audio_lock:
+                state.fv_data, state.fv_sr = loaded["front_vocals"], sr
+                state.bg_vocals_data, state.bg_vocals_sr = loaded["bg_vocals"], sr
+            _saved_cover.add("split")
+        if "strings" in loaded:
+            with audio_lock:
+                state.strings_data, state.strings_sr = loaded["strings"], sr
+                state.strings_is_quick = False
+            _saved_cover.add("strings")
+    except Exception as e:
+        print(f"[Stems] Could not use the saved stems ({e}) — separating "
+              f"as usual")
+        _saved_cover = set()
+        return _saved_cover
+
+    skipped = {"stems": "six-stem", "instrumental": "instrumental",
+               "split": "vocals + karaoke", "strings": "strings"}
+    print(f"[Stems] Skipping: "
+          f"{', '.join(skipped[c] for c in ('stems', 'instrumental', 'split', 'strings') if c in _saved_cover) or 'nothing (a set is incomplete)'}")
+    if running:
+        app.after(0, _after_saved_import)
+    return _saved_cover
+
+
+def _commit_saved_stems(new_stems):
+    """Put imported six-stem cells in place, as a finished separation does."""
+    mono = np.mean(sum(new_stems.values()), axis=1)
+    state.waveform_data = mono[::max(1, len(mono) // 2000)]
+    with audio_lock:
+        state.stems = new_stems
+        state.loaded_audio_name = state.current_audio_name
+        state.stem_volumes = {k: state.stem_volumes.get(k, 1.0) for k in new_stems}
+        state.sr = 44100
+        state.position = 0
+        _eq_zi_state.clear()
+    _apply_saved_fixes()
+    state.separating = False
+
+
+def _after_saved_import():
+    """The UI side of an import: waveform, transport, cell states."""
+    try:
+        if "stems" in _saved_cover:
+            progress_bar.pack_forget()
+            _clear_progress()
+            wave_canvas.pack(fill="both", expand=True)
+            for _b in _all_import_btns():
+                _b.configure(state="normal")
+            _unlock_transport()
+            _draw_static_waveform()
+            _flash_track_name(state.current_audio_name)
+        if "split" in _saved_cover:
+            _split_replaces_vocals()
+        for fn in ("_update_inst_status_label", "_update_strings_status_label",
+                   "_update_fv_button", "_update_bgv_button",
+                   "_update_vocals_status"):
+            f = globals().get(fn)
+            if f is not None:
+                try:
+                    f()
+                except Exception:
+                    pass
+        _playlist_refresh()
+    except Exception as e:
+        print("[Stems] UI update after import:", e)
+
+
+def _six_or_saved(path, cancel=None):
+    """Run the six-stem pass unless all six cells came from saved files."""
+    if "stems" in _saved_cover:
+        return
+    separate(path, cancel=cancel)
+    # Saved strings but freshly separated stems: take the strings out of
+    # OTHER so the two cells stay complementary, as the model pass would.
+    if "strings" in _saved_cover and state.stems and \
+            state.stems.get("other") is not None and state.strings_data is not None:
+        with audio_lock:
+            other = state.stems["other"]
+            n = min(len(other), len(state.strings_data))
+            other[:n] -= state.strings_data[:n]
+
+
+def _inst_or_saved(path, cancel=None, **kw):
+    """Run the instrumental pass unless the INST cell came from a file."""
+    if "instrumental" in _saved_cover:
+        return
+    return separate_inst(path, cancel=cancel, **kw)
+
+
 def _run_post_stem_chains(path, cancel):
     """The two chains that follow the six-stem pass, side by side.
 
@@ -5405,13 +5668,20 @@ def _run_post_stem_chains(path, cancel):
     file reading, resampling or overlap-add.
     """
     def _vocal_chain():
-        if _VOC_AUTO and not cancel.is_set() and vocals_model is not None:
+        if "split" in _saved_cover:
+            return                      # both halves came from saved files
+        # Saved stems mean the VOCALS cell holds what you kept — refining it
+        # again from the main track would overwrite that.
+        if (_VOC_AUTO and "stems" not in _saved_cover and not cancel.is_set()
+                and vocals_model is not None):
             refine_vocals(path, cancel=cancel)
         if not cancel.is_set():
             separate_bg_vocals(cancel=cancel)
             report_split_result()
 
     def _strings_chain():
+        if "strings" in _saved_cover:
+            return
         if (_STR_AUTO and not _STR_FIRST and not cancel.is_set()
                 and strings_model is not None):
             separate_strings(cancel=cancel)
@@ -5463,29 +5733,32 @@ def load_file_path(path):
                 app.after(0, lambda: _paint_ms("instrumental"))
             separate_inst(path, cancel=cancel, ui_progress=True)
             return
+        # Saved stems first: whatever this song already has on disk is
+        # imported, and the passes it covers are skipped below.
+        import_saved_stems(path)
         # LOAD FIRST: the strings model runs on the track itself, so it can
         # go before the six-stem pass and fill its cell that much sooner.
         if (_STR_AUTO and _STR_FIRST and not cancel.is_set()
-                and strings_model is not None):
+                and strings_model is not None and "strings" not in _saved_cover):
             separate_strings(path, cancel=cancel)
         if _INST_AUTO and _INST_CONCURRENT:
-            t_inst = threading.Thread(target=_run_low_priority, args=(separate_inst, path),
+            t_inst = threading.Thread(target=_run_low_priority, args=(_inst_or_saved, path),
                                       kwargs={"cancel": cancel}, daemon=True)
             t_inst.start()
-            separate(path, cancel=cancel)
+            _six_or_saved(path, cancel=cancel)
             t_inst.join()
         elif _INST_AUTO and _INST_FIRST:
             # Instrumental first: it's playable on its own while the stems
             # are still being separated.
-            separate_inst(path, cancel=cancel)
+            _inst_or_saved(path, cancel=cancel)
             if not cancel.is_set():
-                separate(path, cancel=cancel)
+                _six_or_saved(path, cancel=cancel)
         else:
             # Stems first: the song becomes playable in about half the time,
             # then the instrumental fills in behind it.
-            separate(path, cancel=cancel)
+            _six_or_saved(path, cancel=cancel)
             if _INST_AUTO and not cancel.is_set():
-                separate_inst(path, cancel=cancel)
+                _inst_or_saved(path, cancel=cancel)
         # BG VOX comes from the karaoke model, not from a file.
         # The vocal chain and the strings chain, in parallel.
         _run_post_stem_chains(path, cancel)
@@ -5530,6 +5803,26 @@ def _pass_release():
         _pass_lock.release()
     except RuntimeError:
         pass          # never acquired on this path
+
+
+def _stack_padded(chunks, batch_n):
+    """Stack chunks into a batch, padding with silence up to batch_n.
+
+    Every batch then has the same shape. The last batch of a track is
+    usually short — the leftover chunks do not fill it — and with
+    cudnn.benchmark on, a new shape makes cuDNN re-run its algorithm search
+    for every layer, allocating trial workspace as it goes. On a model this
+    size that can take minutes or run out of memory, and it happened at the
+    same place in every track: the start of the final batch, which is where
+    the instrumental pass sat at 86%. The padding chunks are silence and
+    their outputs are never read.
+    """
+    batch = np.stack(chunks)
+    short = batch_n - len(chunks)
+    if short > 0:
+        batch = np.concatenate(
+            [batch, np.zeros((short,) + batch.shape[1:], dtype=batch.dtype)])
+    return np.ascontiguousarray(batch)
 
 
 def _is_oom(err):
@@ -5867,11 +6160,10 @@ def _update_inst_status_label():
     elif _inst_separating:
         lbl.configure(text="SEPARATING...", text_color=TEXT_DIM)
     elif state.instrumental is not None:
-        dur = len(state.instrumental) / 44100
         if state.instrumental_is_quick:
-            lbl.configure(text=f"QUICK MIX  {dur:.0f}s", text_color="#ffaa00")
+            lbl.configure(text="QUICK MIX", text_color="#ffaa00")
         else:
-            lbl.configure(text=f"FULL MIX  {dur:.0f}s", text_color="#44cc44")
+            lbl.configure(text="FULL MIX", text_color="#44cc44")
     elif inst_model_ready and inst_model is None:
         lbl.configure(text="MODEL FAILED", text_color=BRIGHT_RED)
     else:
@@ -5956,8 +6248,8 @@ def separate(path, into=None, cancel=None):
         # chunk / overlap in samples — from the model's own config when it
         # has one (see _chunking_from_config), else the values above.
         chunk_s, overlap_s = _chunking_from_config(_bsr_config, _MODEL_SR)
-        chunk_n     = int(chunk_s   * sr_i)
-        overlap_n   = int(overlap_s * sr_i)
+        chunk_n     = int(round(chunk_s   * sr_i))
+        overlap_n   = int(round(overlap_s * sr_i))
         step_n      = chunk_n - 2 * overlap_n
 
         # Output buffer: (n_stems, N, 2)
@@ -6014,7 +6306,7 @@ def separate(path, into=None, cancel=None):
                 try:
                     # (B, 2, T). Pinned memory lets the copy to the card run
                     # asynchronously alongside work already queued on it.
-                    x = torch.from_numpy(np.ascontiguousarray(np.stack(chunks)))
+                    x = torch.from_numpy(_stack_padded(chunks, batch_n))
                     if run_device.type == "cuda":
                         x = x.pin_memory().to(run_device, non_blocking=True)
                     else:
@@ -8002,6 +8294,183 @@ _update_btn = ctk.CTkButton(header, text="⟳ UPDATE", command=_on_update_click,
                             border_color=BORDER, height=26, width=110)
 _update_btn.pack(side="right", padx=(0, 8))
 
+
+def _ask_passphrase(parent, title, prompt):
+    """A masked passphrase prompt; returns the text, or None if cancelled."""
+    from tkinter import simpledialog
+    return simpledialog.askstring(title, prompt, show="•", parent=parent)
+
+
+_tips_win = [None]
+
+
+def open_tips():
+    """Show the tips, read-only; EDIT unlocks them for the author."""
+    win = _tips_win[0]
+    if win is not None and win.winfo_exists():
+        win.deiconify()
+        win.lift()
+        return win
+
+    win = ctk.CTkToplevel(app)
+    win.title("R·A·M·M·A — TIPS")
+    win.geometry("640x560")
+    win.minsize(420, 320)
+    win.configure(fg_color=BG)
+    _tips_win[0] = win
+
+    ctk.CTkLabel(win, text="— TIPS —", font=FONT_TITLE,
+                 text_color="#e6c000").pack(pady=(10, 4))
+
+    box = ctk.CTkTextbox(win, font=("Courier New", 13), wrap="word",
+                         fg_color=PANEL, text_color=TEXT_MAIN,
+                         border_color=STEEL, border_width=1, corner_radius=0)
+    box.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+    def _show_text():
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        box.insert("1.0", _read_tips())
+        box.configure(state="disabled")     # read-only until unlocked
+    _show_text()
+
+    row = ctk.CTkFrame(win, fg_color="transparent")
+    row.pack(fill="x", padx=14, pady=(0, 12))
+    status = ctk.CTkLabel(row, text="", font=FONT_SMALL, text_color=TEXT_DIM)
+    status.pack(side="left")
+
+    editing = [False]
+
+    def _edit_or_save():
+        if not editing[0]:
+            # Unlock: set the passphrase the first time, check it after.
+            if not _TIPS_EDITOR_HASH:
+                p1 = _ask_passphrase(win, "RAMMA — set the editor passphrase",
+                                     "No editor passphrase is set yet.\n"
+                                     "Choose one — you will need it to edit "
+                                     "the tips from now on:")
+                if not p1:
+                    return
+                p2 = _ask_passphrase(win, "RAMMA — confirm",
+                                     "Type the passphrase again:")
+                if p1 != p2:
+                    messagebox.showerror("RAMMA", "The two passphrases did not "
+                                         "match. Nothing was changed.",
+                                         parent=win)
+                    return
+                try:
+                    _store_editor_hash(_passphrase_hash(p1))
+                except Exception as e:
+                    messagebox.showerror("RAMMA", f"The passphrase could not "
+                                         f"be saved: {e}", parent=win)
+                    return
+                print("[Tips] Editor passphrase set — its hash is now in "
+                      "ramma.py")
+            else:
+                phrase = _ask_passphrase(win, "RAMMA — edit tips",
+                                         "Editor passphrase:")
+                if phrase is None:
+                    return
+                if _passphrase_hash(phrase) != _TIPS_EDITOR_HASH:
+                    messagebox.showerror("RAMMA", "That passphrase is not "
+                                         "right.", parent=win)
+                    return
+            editing[0] = True
+            box.configure(state="normal")
+            if box.get("1.0", "end").strip() == _TIPS_DEFAULT.strip():
+                box.delete("1.0", "end")
+            box.focus_set()
+            edit_btn.configure(text="💾 SAVE", text_color=BRIGHT_GREEN)
+            status.configure(text="Editing — press SAVE when done",
+                             text_color="#e6c000")
+        else:
+            try:
+                _write_tips(box.get("1.0", "end"))
+            except Exception as e:
+                messagebox.showerror("RAMMA", f"The tips could not be "
+                                     f"saved: {e}", parent=win)
+                return
+            editing[0] = False
+            _show_text()
+            edit_btn.configure(text="✎ EDIT", text_color=TEXT_DIM)
+            status.configure(text="Saved to tips.txt", text_color=BRIGHT_GREEN)
+            print(f"[Tips] Saved to {_TIPS_PATH}")
+
+    def _close():
+        if editing[0] and not messagebox.askyesno(
+                "RAMMA", "Close without saving your changes?", parent=win):
+            return
+        editing[0] = False
+        edit_btn.configure(text="✎ EDIT", text_color=TEXT_DIM)
+        status.configure(text="")
+        _show_text()
+        win.withdraw()
+
+    ctk.CTkButton(row, text="CLOSE", command=_close, width=90, height=28,
+                  fg_color=STEEL, hover_color=STEEL_LIGHT, text_color=TEXT_MAIN,
+                  font=FONT_SMALL, corner_radius=0, border_width=1,
+                  border_color=BORDER).pack(side="right")
+    edit_btn = ctk.CTkButton(row, text="✎ EDIT", command=_edit_or_save,
+                             width=90, height=28,
+                             fg_color=STEEL, hover_color=STEEL_LIGHT,
+                             text_color=TEXT_DIM, font=FONT_SMALL,
+                             corner_radius=0, border_width=1,
+                             border_color=BORDER)
+    edit_btn.pack(side="right", padx=(0, 8))
+
+    win.protocol("WM_DELETE_WINDOW", _close)
+    win.transient(app)
+    win.lift()
+    return win
+
+
+_tips_btn = ctk.CTkButton(header, text="💡 TIPS", command=open_tips,
+                          fg_color=STEEL, hover_color=STEEL_LIGHT,
+                          text_color="#e6c000",
+                          font=("Courier New", 12, "bold"),
+                          corner_radius=0, border_width=1,
+                          border_color=BORDER, height=26, width=100)
+_tips_btn.pack(side="right", padx=(0, 8))
+
+
+def _on_locate_stems():
+    """Choose the folder saved stems are kept in, and say what it holds."""
+    folder = filedialog.askdirectory(
+        title="Where are your saved stems?",
+        initialdir=state.saved_stems_dir or state.export_folder or None)
+    if not folder:
+        return
+    state.saved_stems_dir = folder
+    _save_dirs()
+    print(f"[Stems] Saved stems will be looked for in {folder}")
+
+    path = _playlist_current[0]
+    if not path:
+        messagebox.showinfo(
+            "RAMMA — saved stems",
+            f"Saved stems will be looked for in:\n{folder}\n\n"
+            f"Any song you load whose stems are there will use them instead "
+            f"of separating again.")
+        return
+    found = find_saved_stems(path)
+    song = os.path.splitext(os.path.basename(path))[0]
+    if not found:
+        messagebox.showinfo(
+            "RAMMA — saved stems",
+            f"No saved stems for \"{song}\" in that folder.\n\nFiles are "
+            f"matched by name — {song}_vocals.wav, {song}_drums.wav and so "
+            f"on, as EXPORT STEMS writes them.")
+        return
+    if messagebox.askyesno(
+            "RAMMA — saved stems",
+            f"Found saved stems for \"{song}\":\n  "
+            + ", ".join(sorted(found)) +
+            "\n\nLoad the song again now and use them?"):
+        load_file_path(path)
+
+
+
+
 # ============================================================
 # SCROLLABLE CONTENT AREA — hosts everything below the header
 # ============================================================
@@ -8225,7 +8694,7 @@ btn_stop.pack(side="left", padx=4)
 
 _btn(transport, "≋ EQ",             open_eq_window).pack(side="left", padx=4)
 _btn(transport, "⬡ EXPORT FOLDER",  choose_export_folder).pack(side="left", padx=4)
-_btn(transport, "↺ CLEAR LOOP",     _loop_clear).pack(side="left", padx=4)
+_btn(transport, "⌕ LOCATE STEMS",   _on_locate_stems).pack(side="left", padx=4)
 _btn(transport, "💾 SAVE SESSION",  save_session).pack(side="left", padx=4)
 _btn(transport, "📂 LOAD SESSION",  load_session).pack(side="left", padx=4)
 _btn(transport, "⬡ BOUNCE",         bounce_to_stem).pack(side="left", padx=4)
