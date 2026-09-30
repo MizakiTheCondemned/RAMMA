@@ -148,8 +148,8 @@ BRIGHT_RED  = "#cc0000"       # hot-forge red
 GLOW_RED    = "#ff2200"       # arc-weld flare
 STEEL       = "#3a3a3a"       # brushed steel mid-tone
 STEEL_LIGHT = "#555555"       # highlight on steel
-TEXT_DIM    = "#666666"       # etched label
-TEXT_MAIN   = "#c8c8c8"       # cold white stencil
+TEXT_DIM    = "#ffffff"       # etched label (white: easier to read)
+TEXT_MAIN   = "#ffffff"       # white
 BRIGHT_GREEN = "#00ff66"      # high-visibility green for action buttons
 
 # Mute / Solo buttons — sized so they stay legible at any window size.
@@ -1258,7 +1258,7 @@ _UPDATE_FILES  = [
     # "requirements.txt",
     # "RAMMA.bat",
     "models.json",
-    "tips.txt",     # uncomment once tips.txt is in your repository
+    # "tips.txt",     # uncomment once tips.txt is in your repository
 ]
 _UPDATE_CHECK  = True          # look for updates at start-up
 _UPDATE_ASK    = True          # ask before installing; False installs quietly
@@ -1955,6 +1955,13 @@ _KARA_CFG_PATH  = ""
 # that author's other models — becruily's vocals model was being loaded as
 # the karaoke model, which is why the lead/backing split came out wrong.
 _KARA_NAME_HINTS   = ("karaoke", "kara")
+# Which karaoke model is used when several are installed, most wanted first.
+# Anything not listed comes after these, alphabetically.
+_KARA_PREFER       = ("gabox", "becruily", "aufr33")
+_KARA_AUTO         = True    # split into FRT VOX + BG VOX after every track
+_KARA_FIRST        = False   # do the split before the six-stem pass
+_kara_done_first   = [False] # the split already ran first for this load
+_last_refined      = [None]  # the vocals model's latest output
 _KARA_NAME_EXCLUDE = ("instvoc", "inst_voc", "instrum", "resurrection",
                       "bowed", "string", "sw-fixed", "sw_fixed", "rofo-sw")
 
@@ -2392,6 +2399,30 @@ def _split_halves_exist():
 # much they share, and muting is yours to decide.
 
 
+def _vocals_follow(kind):
+    """Copy VOCALS' mute or solo onto FRT VOX and BG VOX.
+
+    Once the split has run, VOCALS is the control for both halves, so its M
+    and S buttons set theirs too — and the halves' own buttons light up to
+    show it. Each half can still be muted or soloed on its own afterwards.
+    Returns True when it acted (that is, when VOCALS is the VCA).
+    """
+    if not getattr(state, "vocals_is_vca", False):
+        return False
+    source, target = ((state.stem_mute, state.stem_mute) if kind == "mute"
+                      else (state.stem_solo, state.stem_solo))
+    value = bool(source.get("vocals", False))
+    for _k in ("front_vocals", "bg_vocals"):
+        target[_k] = value
+    _halves_muted_by_vocals.clear()
+    for _k in ("vocals", "front_vocals", "bg_vocals"):
+        try:
+            _paint_ms(_k)
+        except (NameError, KeyError):
+            pass
+    return True
+
+
 def _vocals_toggled_with_split():
     """VOCALS and the two split halves are the same vocal: play one or the other.
 
@@ -2586,7 +2617,18 @@ def _kara_find_files():
                 continue
             if any(h in low for h in _KARA_NAME_HINTS):
                 hits.append(f)
-        return sorted(hits)[0] if hits else None
+        if not hits:
+            return None
+
+        # Preferred authors first (gabox by default), then alphabetical — so
+        # the choice no longer depends on which name happens to sort first.
+        def _rank(f):
+            low = os.path.basename(f).lower()
+            for i, who in enumerate(_KARA_PREFER):
+                if who in low:
+                    return (i, low)
+            return (len(_KARA_PREFER), low)
+        return sorted(hits, key=_rank)[0]
 
     for d in _INST_SEARCH_DIRS:
         try:
@@ -2598,12 +2640,47 @@ def _kara_find_files():
         if ck is None:
             ck = _hinted([f for f in entries
                           if f.lower().endswith((".ckpt", ".pth", ".bin"))])
-        if cf is None:
-            cf = _hinted([f for f in entries
-                          if f.lower().endswith((".yaml", ".yml"))])
+        if cf is None and ck is not None:
+            # The config that goes with THIS checkpoint, by name — not simply
+            # the most preferred author's config, which paired a gabox
+            # checkpoint with becruily's config and built the wrong model.
+            yamls = [f for f in entries if f.lower().endswith((".yaml", ".yml"))]
+            cf = _best_config_for(ck, yamls)
         if ck and cf:
             break
     return ck, cf
+
+
+def _name_tokens(path):
+    base = os.path.splitext(os.path.basename(path))[0].lower()
+    return [t for t in re.split(r"[^a-z0-9]+", base)
+            if t and t not in ("config", "cconfig", "model", "mel", "band",
+                               "roformer", "bs", "ckpt")]
+
+
+def _best_config_for(ckpt, yamls):
+    """The config whose name best matches a checkpoint's name.
+
+    Whole-word matches count fully, part-word matches (gabox inside
+    gaboxaufr) half, and config words the checkpoint lacks count against.
+    Only a guess — the loader then checks the pair actually fits.
+    """
+    if not yamls:
+        return None
+    ck_tokens = _name_tokens(ckpt)
+
+    def score(y):
+        total = 0.0
+        for t in _name_tokens(y):
+            if t in ck_tokens:
+                total += len(t)
+            elif any(t in c or c in t for c in ck_tokens):
+                total += len(t) * 0.5
+            else:
+                total -= len(t) * 0.25
+        return total
+
+    return max(sorted(yamls), key=score)
 
 
 def load_kara_model():
@@ -2708,28 +2785,92 @@ def load_kara_model():
                         "pip install BS-RoFormer over it, that replaces the package "
                         f"the other two models use. Original error: {ie}") from ie
 
-                import inspect
-                accepted = set(inspect.signature(MelBandRoformer.__init__).parameters)
-                kw = {}
-                for k, v in dict(kara_cfg.model).items():
-                    if k in accepted:
-                        kw[k] = tuple(v) if isinstance(v, list) else v
-                if "sample_rate" in accepted:
-                    kw.setdefault("sample_rate", _kara_sr)
-                if "flash_attn" in accepted:
-                    kw["flash_attn"] = bool(torch.cuda.is_available()) and not _SAFE_MODE
-                m = MelBandRoformer(**kw)
-            else:
+            def _build_for(cfg, report=True):
+                """Construct the karaoke model a given config describes."""
+                if is_mel:
+                    import inspect
+                    accepted = set(inspect.signature(MelBandRoformer.__init__).parameters)
+                    kw, dropped = {}, []
+                    for k, v in dict(cfg.model).items():
+                        if k in accepted:
+                            kw[k] = tuple(v) if isinstance(v, list) else v
+                        else:
+                            dropped.append(k)
+                    # Keys that change the model's SHAPE must not vanish
+                    # quietly: dropping one builds a differently sized model,
+                    # and the checkpoint then fails with hundreds of size
+                    # mismatches that point nowhere near the real cause.
+                    shape_keys = [k for k in dropped if k in (
+                        "mlp_expansion_factor", "num_stems", "num_bands",
+                        "dim", "depth", "mask_estimator_depth", "skip_connection")]
+                    if report and shape_keys:
+                        print(f"[Karaoke] ⚠ Your mel_band_roformer.py does not accept "
+                              f"{', '.join(shape_keys)} — it is older than this model "
+                              f"needs, and those settings are being ignored. Replace it "
+                              f"with the current mel_band_roformer.py from ZFTurbo's "
+                              f"Music-Source-Separation-Training repository.")
+                    if "sample_rate" in accepted:
+                        kw.setdefault("sample_rate", _kara_sr)
+                    if "flash_attn" in accepted:
+                        kw["flash_attn"] = bool(torch.cuda.is_available()) and not _SAFE_MODE
+                    return MelBandRoformer(**kw)
                 get_model_from_config = _import_bs_roformer()["get_model_from_config"]
-                m = get_model_from_config("bs_roformer", kara_cfg)
-            if m is None:
-                raise RuntimeError("Could not build the karaoke model from its config")
+                return get_model_from_config("bs_roformer", cfg)
 
             sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             if isinstance(sd, dict) and "state_dict" in sd:
                 sd = sd["state_dict"]
             if isinstance(sd, dict):
                 sd = {k[7:] if k.startswith("module.") else k: v for k, v in sd.items()}
+
+            def _fit(model):
+                """Share of the model's weights this checkpoint fills exactly."""
+                own = model.state_dict()
+                ok = sum(1 for k, v in sd.items()
+                         if k in own and tuple(own[k].shape) == tuple(v.shape))
+                return ok / max(1, len(own)), ok, len(own)
+
+            m = _build_for(kara_cfg)
+            if m is None:
+                raise RuntimeError("Could not build the karaoke model from its config")
+            share, ok, total = _fit(m)
+
+            if share < 0.999:
+                # The config named beside this checkpoint does not describe it.
+                # Try the other configs in the folder and keep the one whose
+                # model the checkpoint fills exactly — the pairing then no
+                # longer depends on file names at all.
+                print(f"[Karaoke] {os.path.basename(cfg_path)} fits only "
+                      f"{ok} of {total} weights — looking for the config that "
+                      f"matches {os.path.basename(ckpt_path)}…")
+                folder = os.path.dirname(ckpt_path)
+                best = (share, m, kara_cfg, cfg_path)
+                for name in sorted(os.listdir(folder)):
+                    cand = os.path.join(folder, name)
+                    if not name.lower().endswith((".yaml", ".yml")) or \
+                            os.path.abspath(cand) == os.path.abspath(cfg_path):
+                        continue
+                    try:
+                        with open(cand, "r", encoding="utf-8") as f:
+                            c_cfg = ConfigDict(yaml.load(f, Loader=_YL))
+                        c_m = _build_for(c_cfg, report=False)
+                        c_share = _fit(c_m)[0]
+                    except Exception:
+                        continue
+                    if c_share > best[0]:
+                        best = (c_share, c_m, c_cfg, cand)
+                    if c_share >= 0.999:
+                        break
+                if best[3] != cfg_path and best[0] > share:
+                    share, m, kara_cfg, cfg_path = best
+                    _KARA_CFG_PATH = cfg_path
+                    print(f"[Karaoke] Using {os.path.basename(cfg_path)} — it "
+                          f"matches the checkpoint ({share * 100:.0f}% of weights)")
+                    # Report dropped shape keys for the config actually used.
+                    _build_for(kara_cfg, report=True)
+                    _kara_chunk_s, _kara_overlap_s = _chunking_from_config(
+                        kara_cfg, _kara_sr, fallback_chunk=_kara_chunk_s)
+
             _load_state_forgiving(m, sd, os.path.basename(ckpt_path))
 
             # Which output is the backing vocals, and which the lead?
@@ -2864,7 +3005,7 @@ def _orient_halves(lead, back):
     return lead, back
 
 
-def separate_bg_vocals(into=None, cancel=None):
+def separate_bg_vocals(into=None, cancel=None, src_override=None):
     """Split the separated vocals into lead and backing, keeping both.
 
     Runs on state.stems["vocals"] — the karaoke model only has to look at the
@@ -2893,7 +3034,9 @@ def separate_bg_vocals(into=None, cancel=None):
         return
 
     src = None
-    if bg:
+    if src_override is not None:
+        src = src_override          # LOAD FIRST: the refined vocals directly
+    elif bg:
         src = into.get("_vocals_src")
     elif state.stems:
         src = state.stems.get("vocals")
@@ -3404,6 +3547,9 @@ def refine_vocals(path, cancel=None):
         if run_device.type != device.type:
             vocals_model.to(device)
         refined = np.ascontiguousarray(out.T)
+        # Kept here too: with LOAD FIRST the split runs on this before the
+        # six stems — and so the VOCALS cell — exist.
+        _last_refined[0] = refined
         with audio_lock:
             if state.stems:
                 n = min(len(refined), state.stems["vocals"].shape[0])
@@ -3449,6 +3595,8 @@ def separate_strings(path=None, cancel=None):
 
     _strings_separating = True
     _fg_enter("strings")
+    if running:
+        app.after(0, _update_strings_status_label)
     try:
         audio = np.asarray(state.stems["other"], dtype=np.float32).copy()
         sr_i = int(state.sr or _str_sr)
@@ -5418,6 +5566,7 @@ def load_file():
         # Saved stems first: whatever this song already has on disk is
         # imported, and the passes it covers are skipped below.
         import_saved_stems(path)
+        _kara_load_first(path, cancel)
         # LOAD FIRST: the strings model runs on the track itself, so it can
         # go before the six-stem pass and fill its cell that much sooner.
         if (_STR_AUTO and _STR_FIRST and not cancel.is_set()
@@ -5657,6 +5806,33 @@ def _inst_or_saved(path, cancel=None, **kw):
     return separate_inst(path, cancel=cancel, **kw)
 
 
+def _kara_load_first(path, cancel):
+    """Split the vocals before the six-stem pass, when asked to.
+
+    Needs a vocals model: the karaoke split works on a vocal, and before the
+    six stems exist the only vocal available is the one the vocals model
+    pulls straight out of the main track.
+    """
+    _kara_done_first[0] = False
+    _last_refined[0] = None
+    if not (_KARA_FIRST and _KARA_AUTO) or cancel.is_set():
+        return
+    if "split" in _saved_cover:
+        return
+    if vocals_model is None or kara_model is None:
+        print("[Karaoke] LOAD FIRST needs a vocals model to split from before "
+              "the six stems exist — splitting after them instead")
+        return
+    print("[Karaoke] LOAD FIRST: vocals model, then the split, then the six stems")
+    refine_vocals(path, cancel=cancel)
+    if cancel.is_set() or _last_refined[0] is None:
+        return
+    separate_bg_vocals(cancel=cancel, src_override=_last_refined[0])
+    report_split_result()
+    if state.fv_data is not None or state.bg_vocals_data is not None:
+        _kara_done_first[0] = True
+
+
 def _run_post_stem_chains(path, cancel):
     """The two chains that follow the six-stem pass, side by side.
 
@@ -5670,11 +5846,27 @@ def _run_post_stem_chains(path, cancel):
     def _vocal_chain():
         if "split" in _saved_cover:
             return                      # both halves came from saved files
+        if _kara_done_first[0]:
+            # LOAD FIRST already split the refined vocals; now that the six
+            # stems exist, the VOCALS cell takes that refined vocal too.
+            if _last_refined[0] is not None and state.stems:
+                with audio_lock:
+                    v = state.stems["vocals"]
+                    n = min(len(v), len(_last_refined[0]))
+                    v[:n] = _last_refined[0][:n]
+                    state.vocals_refined = True
+            if running:
+                app.after(0, _split_replaces_vocals)
+            return
         # Saved stems mean the VOCALS cell holds what you kept — refining it
         # again from the main track would overwrite that.
         if (_VOC_AUTO and "stems" not in _saved_cover and not cancel.is_set()
                 and vocals_model is not None):
             refine_vocals(path, cancel=cancel)
+        if not _KARA_AUTO:
+            print("[Karaoke] AUTO SEPARATE is off — press SEPARATE NOW to "
+                  "split the vocals")
+            return
         if not cancel.is_set():
             separate_bg_vocals(cancel=cancel)
             report_split_result()
@@ -5736,6 +5928,7 @@ def load_file_path(path):
         # Saved stems first: whatever this song already has on disk is
         # imported, and the passes it covers are skipped below.
         import_saved_stems(path)
+        _kara_load_first(path, cancel)
         # LOAD FIRST: the strings model runs on the track itself, so it can
         # go before the six-stem pass and fill its cell that much sooner.
         if (_STR_AUTO and _STR_FIRST and not cancel.is_set()
@@ -5971,6 +6164,8 @@ def _unload_track_extras():
     state.bg_vocals_data = None
     state.strings_data   = None
     state.strings_is_quick = False
+    if running:
+        app.after(0, _update_strings_status_label)   # WAITING, straight away
     state.instrumental   = None
     _halves_muted_by_vocals.clear()
     state.instrumental_is_quick = False
@@ -8175,11 +8370,11 @@ def open_eq_window():
         # HID LAYER is retired from the mixer, so it has no place here
         # either. state.eq_bands still carries its entry (presets and saved
         # sessions may hold one), hence the filter rather than a delete.
-        _EQ_HIDDEN = ("hidden_layer",)
         _EQ_LABELS = {
             "front_vocals": "FRT VOX",
             "bg_vocals":    "BG VOX",
             "any":        "ANY",
+            "strings":    "STRINGS",
             "atmos_fl":    "ATMOS FL",
             "atmos_fr":    "ATMOS FR",
             "atmos_c":    "ATMOS C",
@@ -8190,7 +8385,13 @@ def open_eq_window():
             "any++":           "ANY++",
             "instrumental": "INST",
         }
-        all_eq_stems = [k for k in state.eq_bands.keys() if k not in _EQ_HIDDEN]
+        # Exactly the cells the mixer shows, in the order it shows them:
+        # the main row left to right, then the ATMOS row. Read from the grid
+        # itself, so the matrix keeps up if cells are added or moved, and
+        # cells that were removed (ANY+, ANY++) no longer appear.
+        all_eq_stems = _mixer_cell_order()
+        for _k in all_eq_stems:
+            state.eq_bands.setdefault(_k, [0] * 5)
         for stem in all_eq_stems:
             label = _EQ_LABELS.get(stem, stem.upper())
             if stem in ("front_vocals", "bg_vocals", "hidden_layer", "any", "any+", "any++"):
@@ -8302,6 +8503,7 @@ def _ask_passphrase(parent, title, prompt):
 
 
 _tips_win = [None]
+_tips_box = [None]      # the text inside it, for the wheel router
 
 
 def open_tips():
@@ -8326,6 +8528,7 @@ def open_tips():
                          fg_color=PANEL, text_color=TEXT_MAIN,
                          border_color=STEEL, border_width=1, corner_radius=0)
     box.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+    _tips_box[0] = box
 
     def _show_text():
         box.configure(state="normal")
@@ -8594,6 +8797,32 @@ def _on_canvas_resize(event):
 _sf.bind("<Configure>", _on_sf_configure)
 _scroll_canvas.bind("<Configure>", _on_canvas_resize)
 
+def _mixer_cell_order():
+    """Every visible mixer cell's key, in on-screen order.
+
+    Main row first, left to right, then the ATMOS row. A cell is found from
+    its M button; cells built but never shown (the retired ones) are not in
+    either grid and are left out.
+    """
+    grids = [g for g in (globals().get("mixer_grid"), globals().get("atmos_grid"))
+             if g is not None]
+    placed = []
+    for key, btn in (globals().get("_mute_btns") or {}).items():
+        w = btn
+        while w is not None and w.master is not None and w.master not in grids:
+            w = w.master
+        if w is None or w.master not in grids:
+            continue
+        try:
+            if w.winfo_manager() != "grid":
+                continue
+            col = int(w.grid_info().get("column", 0))
+        except Exception:
+            continue
+        placed.append(((grids.index(w.master), col), key))
+    return [k for _pos, k in sorted(placed)]
+
+
 def _wheel_target(event):
     """Which canvas the wheel should scroll, judged by the window under it."""
     try:
@@ -8613,6 +8842,17 @@ def _wheel_target(event):
     llw = globals().get("_loadlist_win")
     if llw is not None and top is llw:
         return None
+    # The Tips window scrolls its own text. Over the text itself the text
+    # widget already scrolls natively, so do nothing (scrolling it here too
+    # would move it twice); anywhere else in that window — the title, the
+    # buttons — scroll the text rather than the main window behind it.
+    tw = (globals().get("_tips_win") or [None])[0]
+    if tw is not None and top is tw:
+        box = (globals().get("_tips_box") or [None])[0]
+        inner = getattr(box, "_textbox", box) if box is not None else None
+        if inner is None or event.widget is inner:
+            return None
+        return inner
     for _k, _w in (globals().get("_dyn_windows") or {}).items():
         try:
             if _w.winfo_exists() and top is _w:
@@ -9990,7 +10230,9 @@ for col_idx, name in enumerate(STEMS):
             _toggle_mute(n)
             _inst_muted_by_us.discard(n)
             if n == "vocals":
-                if _split_halves_exist():
+                if _vocals_follow("mute"):
+                    pass            # VCA: the halves follow VOCALS
+                elif _split_halves_exist():
                     # The split halves are the alternative to this stem, so
                     # the button swaps between them rather than soloing
                     # INSTRUM (which would silence the halves too).
@@ -10011,6 +10253,8 @@ for col_idx, name in enumerate(STEMS):
         def _cmd():
             state.stem_solo[n] = not state.stem_solo.get(n, False)
             _paint_ms(n)
+            if n == "vocals":
+                _vocals_follow("solo")      # the halves follow VOCALS
         return _cmd
     _sb = ctk.CTkButton(_hdr, text="S", command=_make_solo(name),
                          fg_color=STEEL, hover_color=SOLO_ON,
@@ -10219,7 +10463,7 @@ fv_import_btn = ctk.CTkButton(
 fv_import_btn.pack(fill="x", padx=6, pady=(0, 4))
 # Sub-label: karaoke model credit, in the same form as the INST cell's.
 _kara_title_fv_cell = ctk.CTkLabel(fv_cell, text=_KARA_TITLE,
-             font=("Courier New", 11), text_color=STEEL_LIGHT,
+             font=("Courier New", 11), text_color=TEXT_MAIN,
              wraplength=140, justify="center")
 _kara_title_fv_cell.pack(pady=(2, 0), fill="x")
 # "by" stays in the dim credit colour; the name itself is picked out.
@@ -10327,7 +10571,7 @@ ctk.CTkButton(_fv_rst_row,
               ).pack(side="left", padx=(0, 4))
 make_meter(_fv_rst_row, "front_vocals").pack(side="left")
 # COMP / LEVELLER / LIMITER, folded behind one header like the main cells
-_make_dynamics_group(fv_cell, "front_vocals")
+_fv_dyn_hdr = _make_dynamics_group(fv_cell, "front_vocals")
 
 # (VOC FOCUS and its BKG slider were removed from this cell.)
 tk.Frame(fv_cell, bg=BG, height=6).pack()
@@ -10423,7 +10667,7 @@ bgv_import_btn = ctk.CTkButton(
 bgv_import_btn.pack(fill="x", padx=6, pady=(0, 4))
 # Sub-label: karaoke model credit, in the same form as the INST cell's.
 _kara_title_bgv_cell = ctk.CTkLabel(bgv_cell, text=_KARA_TITLE,
-             font=("Courier New", 11), text_color=STEEL_LIGHT,
+             font=("Courier New", 11), text_color=TEXT_MAIN,
              wraplength=140, justify="center")
 _kara_title_bgv_cell.pack(pady=(2, 0), fill="x")
 # "by" stays in the dim credit colour; the name itself is picked out.
@@ -10461,23 +10705,44 @@ _bgv_prog_lbl = ctk.CTkLabel(bgv_cell, text="0%",
 
 
 def _set_split_progress(frac):
-    """Show how far the lead/backing split has got, on both cells."""
-    pct = f"{int(round(max(0.0, min(1.0, frac)) * 100))}%"
-    for _lbl, _cell, _after in ((_fv_prog_lbl,  fv_cell,  fv_import_btn),
-                                (_bgv_prog_lbl, bgv_cell, bgv_import_btn)):
+    """Show how far the lead/backing split has got, on both cells.
+
+    A bar and a percentage, as on the INST cell, placed under the model
+    credit. It used to be packed after the ⟳ SPLIT VOX button; once that
+    button was hidden, packing after it failed — silently — and the
+    progress disappeared. The credit row is always shown, so it is a safe
+    place to anchor to.
+    """
+    frac = max(0.0, min(1.0, frac))
+    pct = f"{int(round(frac * 100))}%"
+    for key in ("fv", "bgv"):
+        row = globals().get(f"_{key}_split_row")
+        bar = globals().get(f"_{key}_split_bar")
+        lbl = globals().get(f"_{key}_split_lbl")
+        anchor = globals().get(f"_kara_credit_row_{key}_cell")
+        if row is None:
+            continue
         try:
-            if not _lbl.winfo_ismapped():
-                _lbl.pack(pady=(0, 2), after=_after)
-            _lbl.configure(text=pct)
-        except Exception:
-            pass
+            if not row.winfo_ismapped():
+                try:
+                    row.pack(fill="x", padx=6, pady=(2, 0), after=anchor)
+                except Exception:
+                    row.pack(fill="x", padx=6, pady=(2, 0))   # never vanish
+            bar.set(frac)
+            lbl.configure(text=pct)
+        except Exception as e:
+            print(f"[Karaoke] Could not show the split progress: {e}")
 
 
 def _clear_split_progress():
-    for _lbl in (_fv_prog_lbl, _bgv_prog_lbl):
+    for key in ("fv", "bgv"):
+        row = globals().get(f"_{key}_split_row")
+        if row is None:
+            continue
         try:
-            _lbl.configure(text="0%")
-            _lbl.pack_forget()
+            globals()[f"_{key}_split_bar"].set(0)
+            globals()[f"_{key}_split_lbl"].configure(text="0%")
+            row.pack_forget()
         except Exception:
             pass
 
@@ -10560,7 +10825,7 @@ ctk.CTkButton(_bgv_rst_row,
               ).pack(side="left", padx=(0, 4))
 make_meter(_bgv_rst_row, "bg_vocals").pack(side="left")
 # COMP / LEVELLER / LIMITER, folded behind one header like the main cells
-_make_dynamics_group(bgv_cell, "bg_vocals")
+_bgv_dyn_hdr = _make_dynamics_group(bgv_cell, "bg_vocals")
 
 # (VOC FOCUS and its BKG slider were removed from this cell.)
 tk.Frame(bgv_cell, bg=BG, height=6).pack()
@@ -10951,7 +11216,7 @@ _solo_btns["strings"] = _strings_sb
 
 # The model's name and author, directly under the cell's own name.
 _str_title_lbl = ctk.CTkLabel(_strings_cell, text=_STR_TITLE,
-             font=("Courier New", 11), text_color=STEEL_LIGHT,
+             font=("Courier New", 11), text_color=TEXT_MAIN,
              wraplength=140, justify="center")
 _str_title_lbl.pack(pady=(2, 0), fill="x")
 _str_credit_row = ctk.CTkFrame(_strings_cell, fg_color="transparent")
@@ -11308,7 +11573,7 @@ _solo_btns[_inst_key] = _d_sb
 
 # Sub-label: instrumental model credit
 _inst_title_lbl = ctk.CTkLabel(_inst_cell, text=_INST_TITLE,
-             font=("Courier New", 11), text_color=STEEL_LIGHT,
+             font=("Courier New", 11), text_color=TEXT_MAIN,
              wraplength=140, justify="center")
 _inst_title_lbl.pack(pady=(2, 0), fill="x")
 # "by" stays in the dim credit colour; the name itself is picked out.
@@ -11754,8 +12019,8 @@ _THEME_DEFAULT = {
     "accent_glow":           "#ff2200",
     "util":                  "#3a3a3a",
     "util_hover":            "#555555",
-    "text_main":             "#c8c8c8",
-    "text_dim":              "#666666",
+    "text_main":             "#ffffff",
+    "text_dim":              "#ffffff",
     "label_accent":          "#ff2200",
     "label_bright":          "#cc0000",
     "canvas_bg":             "#060606",
@@ -11776,8 +12041,8 @@ _THEME_EIDII = {
     "accent_glow":           "#ff00ff",
     "util":                  "#3d1066",
     "util_hover":            "#5a1a99",
-    "text_main":             "#f0d0ff",
-    "text_dim":              "#9955cc",
+    "text_main":             "#ffffff",
+    "text_dim":              "#ffffff",
     "label_accent":          "#ff00ff",
     "label_bright":          "#dd44ff",
     "canvas_bg":             "#060010",
@@ -11798,8 +12063,8 @@ _THEME_RAMMSTEIN = {
     "accent_glow":           "#c8a000",
     "util":                  "#0f0f0f",
     "util_hover":            "#222222",
-    "text_main":             "#e8e0d0",
-    "text_dim":              "#666050",
+    "text_main":             "#ffffff",
+    "text_dim":              "#ffffff",
     "label_accent":          "#c8a000",
     "label_bright":          "#a07800",
     "canvas_bg":             "#040404",
@@ -12719,6 +12984,13 @@ def _vocals_status_tick():
         _update_vocals_status()
     except Exception:
         pass
+    # The STRINGS line too. It was only redrawn when its own pass ended, so
+    # loading a new song left it saying READY from the previous one until
+    # the new strings pass finished.
+    try:
+        _update_strings_status_label()
+    except Exception:
+        pass
     if running:
         app.after(500, _vocals_status_tick)
 
@@ -12818,6 +13090,99 @@ report_model_files()
 # No polarity switches: OTHER has the strings taken out of it automatically
 # once gilliaan's model has run, so the two cells no longer share material
 # and there is nothing to cancel.
+
+# ── FRT VOX / BG VOX: AUTO SEPARATE, LOAD FIRST, SEPARATE NOW ────────────
+# The same three controls as the INST cell, in the same place — below RST,
+# above CMP / LVL / LIM. The two cells share one karaoke split, so each pair
+# of switches is tied together: ticking one ticks the other.
+_kara_auto_var  = ctk.BooleanVar(value=_KARA_AUTO)
+_kara_first_var = ctk.BooleanVar(value=_KARA_FIRST)
+
+
+def _on_kara_auto():
+    global _KARA_AUTO
+    _KARA_AUTO = _kara_auto_var.get()
+
+
+def _on_kara_first():
+    global _KARA_FIRST
+    _KARA_FIRST = _kara_first_var.get()
+
+
+def _kara_separate_now():
+    """Split the loaded song's vocals into FRT VOX and BG VOX now."""
+    _bgv_separate_now()
+
+
+for _kcell, _kdyn in ((fv_cell, _fv_dyn_hdr), (bgv_cell, _bgv_dyn_hdr)):
+    _anchor = _kdyn.master                   # the CMP / LVL / LIM row
+    ctk.CTkCheckBox(_kcell, text="AUTO SEPARATE",
+                    variable=_kara_auto_var, command=_on_kara_auto,
+                    font=("Courier New", 11), text_color=TEXT_MAIN,
+                    fg_color=RED, hover_color=BRIGHT_RED,
+                    checkmark_color="#ffffff", corner_radius=0,
+                    border_color=STEEL, checkbox_width=14, checkbox_height=14
+                    ).pack(padx=6, pady=(2, 0), before=_anchor)
+    ctk.CTkCheckBox(_kcell, text="LOAD FIRST",
+                    variable=_kara_first_var, command=_on_kara_first,
+                    font=("Courier New", 11), text_color=TEXT_MAIN,
+                    fg_color=RED, hover_color=BRIGHT_RED,
+                    checkmark_color="#ffffff", corner_radius=0,
+                    border_color=STEEL, checkbox_width=14, checkbox_height=14
+                    ).pack(padx=6, pady=(0, 0), before=_anchor)
+    ctk.CTkButton(_kcell, text="⟳ SEPARATE NOW", command=_kara_separate_now,
+                  fg_color=STEEL, hover_color=STEEL_LIGHT,
+                  text_color=BRIGHT_GREEN,
+                  font=("Courier New", 12, "bold"), corner_radius=0,
+                  border_width=1, border_color=BORDER, height=20
+                  ).pack(fill="x", padx=6, pady=(3, 2), before=_anchor)
+
+# SEPARATE NOW replaces the old ⟳ SPLIT VOX button at the top of each cell.
+# The buttons still exist (other code updates their text) but are not shown.
+for _old in (fv_import_btn, bgv_import_btn):
+    try:
+        _old.pack_forget()
+    except Exception:
+        pass
+
+# ── Split progress on FRT VOX and BG VOX ──────────────────────────────────
+# A bar and a percentage, as the INST cell has, shown only while the split
+# runs (see _set_split_progress).
+for _key, _pcell in (("fv", fv_cell), ("bgv", bgv_cell)):
+    _row = ctk.CTkFrame(_pcell, fg_color="transparent")
+    _bar = ctk.CTkProgressBar(_row, progress_color=GLOW_RED, fg_color=PANEL,
+                              corner_radius=0, height=6)
+    _bar.set(0)
+    _bar.pack(fill="x", padx=2)
+    _lbl = ctk.CTkLabel(_row, text="0%", font=("Courier New", 16, "bold"),
+                        text_color=GLOW_RED)
+    _lbl.pack()
+    globals()[f"_{_key}_split_row"] = _row
+    globals()[f"_{_key}_split_bar"] = _bar
+    globals()[f"_{_key}_split_lbl"] = _lbl
+
+# ── CMP / LVL / LIM placement ─────────────────────────────────────────────
+# In the STRINGS cell the dynamics button sits straight after RST, with the
+# separation controls below it. INST, FRT VOX and BG VOX had it at the very
+# bottom; move it up so all four model cells read the same way.
+def _cmp_above_controls(cell):
+    import customtkinter as _ctk
+    dyn_wrap = first_ctrl = None
+    for child in cell.winfo_children():
+        if first_ctrl is None and isinstance(child, _ctk.CTkCheckBox) and \
+                str(child.cget("text")).strip() == "AUTO SEPARATE":
+            first_ctrl = child
+        if dyn_wrap is None and isinstance(child, (_ctk.CTkFrame, tk.Frame)):
+            for sub in child.winfo_children():
+                if isinstance(sub, _ctk.CTkButton) and "CMP" in str(sub.cget("text")):
+                    dyn_wrap = child
+                    break
+    if dyn_wrap is not None and first_ctrl is not None:
+        dyn_wrap.pack_configure(before=first_ctrl)
+
+
+for _c in (_inst_cell, fv_cell, bgv_cell):
+    _cmp_above_controls(_c)
 
 # Credit whichever model each cell is actually going to load.
 sync_model_credits()
