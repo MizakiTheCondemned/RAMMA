@@ -61,6 +61,10 @@ When INST was separating and got to 86%, it sometimes would stop separating for 
 
 Several other bugs were fixed.
 
+Text is easier to read.
+
+EQ Matrix was fixed.
+
 Hyper-loading was added.
 
 The Locate Stems button and function was added, which works with Hyper-loading.
