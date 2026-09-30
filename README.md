@@ -21,10 +21,6 @@ Read the "IMPORTANT! READ FIRST!" text file.
 The models will download automatically upon first run.
 -
 
-2026-09-27
-
-NEW
-
 Strings by gilliaan was added to the program. You can now solo out Strings, but at the cost of muting the Other stem.
 To play them both, solo both.
 I might add a different way to circumvent the volume increase that happens when both play at the same time, but for now I will leave it at this.
@@ -33,7 +29,7 @@ I might add a different way to circumvent the volume increase that happens when 
 
 # RAMMA v0.667.1 is released!
 
-What's new
+What's new:
 
 Auto-updater 
 
@@ -50,3 +46,18 @@ I got permission from gilliaan to use their bowed strings model, so it is includ
 Big thanks to megy for coming up with ideas.
 
 A way to circumvent the volume increase that happens when both Other and Strings are played have been implemented.
+
+2026-09-30
+
+# RAMMA v0.667.1 mini-update
+
+What's new:
+
+A bug was fixed:
+When INST was separating and got to 86%, it sometimes would stop separating for a while.
+
+Hyper-loading was added.
+
+The Locate Stems button and function was added, which works with Hyper-loading.
+
+The Tips window was added.
