@@ -1,4 +1,7 @@
 # RAMMA
+
+2026-09-27
+
 RAMMA version 0.667
 
 RAMMA is free for everyone to use.
@@ -25,9 +28,9 @@ Strings by gilliaan was added to the program. You can now solo out Strings, but 
 To play them both, solo both.
 I might add a different way to circumvent the volume increase that happens when both play at the same time, but for now I will leave it at this.
 
-2026-09-29
-
 # RAMMA v0.667.1 is released!
+
+2026-09-29
 
 What's new:
 
@@ -47,14 +50,16 @@ Big thanks to megy for coming up with ideas.
 
 A way to circumvent the volume increase that happens when both Other and Strings are played have been implemented.
 
-2026-09-30
+# RAMMA v0.667.1 mini-update & mini-update #2
 
-# RAMMA v0.667.1 mini-update
+2026-09-30
 
 What's new:
 
 A bug was fixed:
 When INST was separating and got to 86%, it sometimes would stop separating for a while.
+
+Several other bugs were fixed.
 
 Hyper-loading was added.
 
