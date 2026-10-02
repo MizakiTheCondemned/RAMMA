@@ -1,3 +1,52 @@
+# RAMMA v.0667.1 mini-update #3
+
+2026-10-02
+
+Bounce was removed as it was pretty much useless.
+
+# RAMMA v0.667.1 mini-update & mini-update #2
+
+2026-09-30
+
+What's new:
+
+A bug was fixed:
+When INST was separating and got to 86%, it sometimes would stop separating for a while.
+
+Several other bugs were fixed.
+
+Text is easier to read.
+
+EQ Matrix was fixed.
+
+Hyper-loading was added.
+
+The Locate Stems button and function was added, which works with Hyper-loading.
+
+The Tips window was added.
+
+# RAMMA v0.667.1 is released!
+
+2026-09-29
+
+What's new:
+
+Auto-updater 
+
+RAMMA will, at the next update, automatically update upon launch when it is being released!
+
+Model selector for FRT VOX and BG VOX.
+
+Improvements in the audio!
+
+I got permission from gabox to use their karaoke model, so it is included in the models.json file.
+
+I got permission from gilliaan to use their bowed strings model, so it is included in the models.json file.
+
+Big thanks to megy for coming up with ideas.
+
+A way to circumvent the volume increase that happens when both Other and Strings are played have been implemented.
+
 # RAMMA
 
 2026-09-27
@@ -27,52 +76,3 @@ The models will download automatically upon first run.
 Strings by gilliaan was added to the program. You can now solo out Strings, but at the cost of muting the Other stem.
 To play them both, solo both.
 I might add a different way to circumvent the volume increase that happens when both play at the same time, but for now I will leave it at this.
-
-# RAMMA v0.667.1 is released!
-
-2026-09-29
-
-What's new:
-
-Auto-updater 
-
-RAMMA will, at the next update, automatically update upon launch when it is being released!
-
-Model selector for FRT VOX and BG VOX.
-
-Improvements in the audio!
-
-I got permission from gabox to use their karaoke model, so it is included in the models.json file.
-
-I got permission from gilliaan to use their bowed strings model, so it is included in the models.json file.
-
-Big thanks to megy for coming up with ideas.
-
-A way to circumvent the volume increase that happens when both Other and Strings are played have been implemented.
-
-# RAMMA v0.667.1 mini-update & mini-update #2
-
-2026-09-30
-
-What's new:
-
-A bug was fixed:
-When INST was separating and got to 86%, it sometimes would stop separating for a while.
-
-Several other bugs were fixed.
-
-Text is easier to read.
-
-EQ Matrix was fixed.
-
-Hyper-loading was added.
-
-The Locate Stems button and function was added, which works with Hyper-loading.
-
-The Tips window was added.
-
-# RAMMA v.0667.1 mini-update #3
-
-2026-10-02
-
-Bounce was removed as it was pretty much useless.
