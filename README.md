@@ -71,7 +71,7 @@ The Locate Stems button and function was added, which works with Hyper-loading.
 
 The Tips window was added.
 
-# RAMMA v.0667 mini-update #3
+# RAMMA v.0667.1 mini-update #3
 
 2026-10-02
 
