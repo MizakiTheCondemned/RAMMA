@@ -70,3 +70,9 @@ Hyper-loading was added.
 The Locate Stems button and function was added, which works with Hyper-loading.
 
 The Tips window was added.
+
+# RAMMA v.0667 mini-update #3
+
+2026-10-02
+
+Bounce was removed as it is pretty much useless.
