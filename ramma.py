@@ -1195,7 +1195,7 @@ def add_model_picker(cell, role, after=None):
 # beside this file; list tips.txt in _UPDATE_FILES and your edits reach
 # everyone with the next update.
 # ============================================================
-_TIPS_EDITOR_HASH = "4b22cc2644f3e1c4889cef71fba9fcf2c7fe95ac5d827bff0f4556191a29c9c2"
+_TIPS_EDITOR_HASH = ""
 _TIPS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tips.txt")
 _TIPS_DEFAULT = ("No tips yet.\n\nThe author of this copy of RAMMA can add "
                  "some with the EDIT button.")
@@ -8134,115 +8134,6 @@ def apply_debleed(chunk: np.ndarray, key: str,
 
 
 
-# ============================================================
-# BOUNCE TO STEM
-# Renders FRT + BG + HID + Synth + Strings together (with all
-# processing applied) into a single float32 buffer, then asks
-# the user which import slot to load it into.
-# ============================================================
-def bounce_to_stem():
-    """Render user-imported stems into a composite buffer and
-    slot it back as a new importable stem."""
-    if state.stems is None:
-        return
-    sr_i   = int(state.sr)
-    length = next(iter(state.stems.values())).shape[0]
-
-    import_slots = {
-        "front_vocals":  ("FRT VOX",     lambda d: _bounce_load(d, "front_vocals")),
-        "bg_vocals":     ("BG VOX",      lambda d: _bounce_load(d, "bg_vocals")),
-        "hidden_layer":  ("HID LAYER",   lambda d: _bounce_load(d, "hidden_layer")),
-        "any":         ("ANY",         lambda d: _bounce_load(d, "any")),
-        "any+":       ("ANY+",        lambda d: _bounce_load(d, "any+")),
-        "any++":            ("ANY++",       lambda d: _bounce_load(d, "any++")),
-    }
-
-    # Ask which slot to write to
-    win = ctk.CTkToplevel(app)
-    win.title("BOUNCE TO STEM")
-    win.geometry("340x295")
-    win.configure(fg_color=BG)
-    win.attributes("-topmost", True)
-    win.lift()
-
-    ctk.CTkLabel(win, text="— BOUNCE TO STEM —",
-                 font=FONT_TITLE, text_color=GLOW_RED).pack(pady=(14, 4))
-    ctk.CTkLabel(win,
-                 text="Renders FRT+BG+HID+SYNTH+STRINGS\ninto one stem. Choose target slot:",
-                 font=FONT_SMALL, text_color=TEXT_DIM).pack(pady=(0, 10))
-
-    for key, (label, fn) in import_slots.items():
-        def _make_cb(f=fn, w=win):
-            def _cb():
-                w.destroy()
-                threading.Thread(target=lambda: _do_bounce(f, sr_i, length),
-                                 daemon=True).start()
-            return _cb
-        ctk.CTkButton(win, text=label, command=_make_cb(),
-                      fg_color=RED, hover_color=BRIGHT_RED,
-                      text_color=TEXT_MAIN, font=FONT_SMALL,
-                      corner_radius=0, height=28).pack(fill="x", padx=30, pady=3)
-
-
-def _do_bounce(load_fn, sr_i, length):
-    """Background: render the mix of import stems only and call load_fn."""
-    BLOCK = 4096
-    rendered = np.zeros((length, 2), dtype=np.float32)
-    for pos in range(0, length, BLOCK):
-        frames = min(BLOCK, length - pos)
-        blk = np.zeros((frames, 2), dtype=np.float32)
-        # Collect import stems only (no Demucs stems, no master FX)
-        for data, vol, key, eq_key in [
-            (state.fv_data,      state.fv_volume,      "front_vocals", "front_vocals"),
-            (state.bg_vocals_data, state.bg_vocals_volume, "bg_vocals", "bg_vocals"),
-            (state.hl_data,      state.hl_volume,      "hidden_layer", "hidden_layer"),
-            (state.any_data,   state.any_volume,   "any",        "any"),
-            (state.any_plus_data, state.any_plus_volume, "any+",      "any+"),
-            (state.any_plusplus_data,      state.any_plusplus_volume,      "any++",           "any++"),
-        ]:
-            if data is None or vol <= 0:
-                continue
-            buf_len = len(data)
-            s = pos % buf_len
-            e = s + frames
-            ch = data[s:e].copy() if e <= buf_len else np.concatenate([data[s:], data[:e-buf_len]])
-            if len(ch) < frames:
-                ch = np.pad(ch, ((0, frames-len(ch)), (0, 0)))
-            ch = apply_eq(ch, sr_i, state.eq_bands.get(eq_key, [0]*5))
-            ch = apply_stem_width(ch, state.stem_widths.get(key, 1.0))
-            ch = apply_pan(ch, state.stem_pan.get(key, 0.0))
-            ch = apply_air(ch, state.stem_air.get(key, 0.0), sr_i)
-            blk += ch * vol
-        rendered[pos:pos+frames] = blk[:frames]
-    np.clip(rendered, -1.0, 1.0, out=rendered)
-    app.after(0, lambda: load_fn(rendered))
-
-
-def _bounce_load(data: np.ndarray, key: str):
-    """Load bounce result into the appropriate import slot."""
-    sr_i = int(state.sr)
-    if key == "front_vocals":
-        state.fv_data, state.fv_sr = data, sr_i
-        fv_import_btn.configure(text="⬡ BOUNCE", text_color=TEXT_MAIN)
-    elif key == "bg_vocals":
-        state.bg_vocals_data, state.bg_vocals_sr = data, sr_i
-        bgv_import_btn.configure(text="⬡ BOUNCE", text_color=TEXT_MAIN)
-    elif key == "hidden_layer":
-        state.hl_data, state.hl_sr = data, sr_i
-        hl_import_btn.configure(text="⬡ BOUNCE")
-    elif key == "any":
-        state.any_data, state.any_sr = data, sr_i
-        any_import_btn.configure(text="⬡ BOUNCE")
-    elif key == "any+":
-        state.any_plus_data, state.any_plus_sr = data, sr_i
-        if any_plus_import_btn is not None:
-            any_plus_import_btn.configure(text="⬡ BOUNCE")
-    elif key == "any++":
-        state.any_plusplus_data, state.any_plusplus_sr = data, sr_i
-        if any_plusplus_import_btn is not None:
-            any_plusplus_import_btn.configure(text="⬡ BOUNCE")
-
-
 _eq_window = None   # singleton reference
 
 def _eq_raise(win):
@@ -8937,7 +8828,6 @@ _btn(transport, "⬡ EXPORT FOLDER",  choose_export_folder).pack(side="left", pa
 _btn(transport, "⌕ LOCATE STEMS",   _on_locate_stems).pack(side="left", padx=4)
 _btn(transport, "💾 SAVE SESSION",  save_session).pack(side="left", padx=4)
 _btn(transport, "📂 LOAD SESSION",  load_session).pack(side="left", padx=4)
-_btn(transport, "⬡ BOUNCE",         bounce_to_stem).pack(side="left", padx=4)
 
 # ── Loadlist toggle ───────────────────────────────────────────────────────────
 _playlist_visible = [False]   # mutable box — toggled by button
