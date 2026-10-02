@@ -75,4 +75,4 @@ The Tips window was added.
 
 2026-10-02
 
-Bounce was removed as it is pretty much useless.
+Bounce was removed as it was pretty much useless.
