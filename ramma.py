@@ -1012,8 +1012,11 @@ def _resplit_with_new_model():
     """
     if not state.stems or state.stems.get("vocals") is None:
         return
+    # The other mode's halves were made by the previous model.
     if state.vocals_lq:
-        return                        # karaoke is off while LQ VOCAL is on
+        _halves_hq[0] = None
+    else:
+        _halves_lq[0] = None
     if state.fv_data is None and state.bg_vocals_data is None:
         return                        # the pipeline's split will use it
     while _kara_separating:
@@ -1335,7 +1338,7 @@ _UPDATE_FILES  = [
     # "requirements.txt",
     # "RAMMA.bat",
     "models.json",
-    "tips.txt",     # uncomment once tips.txt is in your repository
+    # "tips.txt",     # uncomment once tips.txt is in your repository
 ]
 _UPDATE_CHECK  = True          # look for updates at start-up
 _UPDATE_ASK    = True          # ask before installing; False installs quietly
@@ -2501,59 +2504,56 @@ def _restore_vocals_mute():
 
 _vocals_6stem = [None]   # the six-stem model's own vocal, untouched
 _vocals_hq    = [None]   # the HQ vocal, set aside while LQ VOCAL is on
-_halves_hq    = [None]   # (FRT, BG) made from the HQ vocal, set aside likewise
-_manual_split = [False]  # the split under way was asked for with SEPARATE NOW
+_halves_hq    = [None]   # (FRT, BG) made from the HQ vocal, while in Mode I
+_halves_lq    = [None]   # (FRT, BG) made from the six-stem vocal, while in Mode II
+_split_source = ["hq"]   # which vocal the split under way is splitting
 
 
 def _toggle_lq_vocals():
     """Switch the VOCALS cell between the HQ vocal and the six-stem one.
 
-    LQ: VOCALS plays the original six-stem vocal as an ordinary cell, and
-    FRT/BG VOX (made from the HQ vocal) are muted so nothing is doubled.
-    Back to HQ: the HQ vocal returns and, if the split exists, VOCALS is the
-    VCA over FRT/BG VOX again.
+    Both modes use karaoke the same way: FRT/BG VOX hold a split of the
+    vocal that is playing, and VOCALS is the VCA over them, so nothing is
+    heard twice. Each mode keeps its own pair of halves — switching back to
+    a mode whose split exists is instant; a mode without one is split
+    automatically when AUTO SEPARATE is on (or with SEPARATE NOW).
     """
     if not state.stems or state.stems.get("vocals") is None:
         print("[Vocals] Load a song first")
         return
+    if getattr(state, "atmos_separated", False):
+        print("[Vocals] Mode I is not available for Atmos beds")
+        return
     v = state.stems["vocals"]
-    if not state.vocals_lq:
-        if _vocals_6stem[0] is None:
-            print("[Vocals] The original six-stem vocal is not available for "
-                  "this song (its stems came from saved files)")
-            return
-        with audio_lock:
+    going_lq = not state.vocals_lq
+    if going_lq and _vocals_6stem[0] is None:
+        print("[Vocals] The original six-stem vocal is not available for "
+              "this song (its stems came from saved files)")
+        return
+    with audio_lock:
+        # Put away the vocal and halves of the mode being left…
+        if going_lq:
             _vocals_hq[0] = v.copy()
-            n = min(len(v), len(_vocals_6stem[0]))
-            v[:n] = _vocals_6stem[0][:n]
-            state.vocals_lq = True
-            state.vocals_is_vca = False
-            # Karaoke off: the halves were made from the HQ vocal, so they are
-            # set aside entirely (not just muted) — nothing can double the LQ
-            # vocal. SEPARATE NOW on FRT/BG VOX splits the LQ vocal instead.
             _halves_hq[0] = (state.fv_data, state.bg_vocals_data)
-            state.fv_data = None
-            state.bg_vocals_data = None
-            state.stem_mute["vocals"] = False
-        print("[Vocals] LQ VOCAL: playing the original six-stem vocal; karaoke "
-              "is off (SEPARATE NOW on FRT/BG VOX splits the LQ vocal)")
-    else:
-        with audio_lock:
-            if _vocals_hq[0] is not None:
-                n = min(len(v), len(_vocals_hq[0]))
-                v[:n] = _vocals_hq[0][:n]
-            state.vocals_lq = False
-            # The HQ halves come back; any split of the LQ vocal is dropped.
-            fv, bg = _halves_hq[0] or (None, None)
-            _halves_hq[0] = None
-            state.fv_data, state.bg_vocals_data = fv, bg
-            halves = fv is not None or bg is not None
-            state.vocals_is_vca = halves
-            if halves:
-                state.stem_mute["front_vocals"] = False
-                state.stem_mute["bg_vocals"] = False
-                state.stem_mute["vocals"] = False
-        print("[Vocals] Back to the HQ vocal")
+            src, halves = _vocals_6stem[0], _halves_lq[0]
+        else:
+            _halves_lq[0] = (state.fv_data, state.bg_vocals_data)
+            src, halves = _vocals_hq[0], _halves_hq[0]
+        # …and bring in those of the mode being entered.
+        if src is not None:
+            n = min(len(v), len(src))
+            v[:n] = src[:n]
+        fv, bg = halves or (None, None)
+        state.fv_data, state.bg_vocals_data = fv, bg
+        state.vocals_lq = going_lq
+        have = fv is not None or bg is not None
+        state.vocals_is_vca = have
+        state.stem_mute["vocals"] = False
+        if have:
+            state.stem_mute["front_vocals"] = False
+            state.stem_mute["bg_vocals"] = False
+    print(f"[Vocals] {'Mode I: the six-stem vocal' if going_lq else 'Mode II: the HQ vocal'}"
+          + ("" if have else " — not split yet"))
     for _k in ("vocals", "front_vocals", "bg_vocals"):
         try:
             _paint_ms(_k)
@@ -2564,6 +2564,21 @@ def _toggle_lq_vocals():
         _update_vocals_status()
     except Exception:
         pass
+    if not have and _KARA_AUTO and kara_model is not None:
+        _start_mode_split()
+
+
+def _start_mode_split():
+    """Split the vocal of the current mode in the background (AUTO SEPARATE)."""
+    if _kara_separating:
+        return
+    def _run():
+        _lower_thread_priority()
+        separate_bg_vocals()
+        report_split_result()
+    print("[Karaoke] Splitting the "
+          + ("six-stem" if state.vocals_lq else "HQ") + " vocal")
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _paint_lq_button():
@@ -2572,10 +2587,10 @@ def _paint_lq_button():
         return
     try:
         if state.vocals_lq:
-            btn.configure(text="⇄ BACK TO HQ VOCAL", fg_color="#7a3d00",
+            btn.configure(text="⇄ MODE II", fg_color="#7a3d00",
                           hover_color="#a35200")
         else:
-            btn.configure(text="⇄ LQ 6-STEM VOCAL", fg_color=STEEL,
+            btn.configure(text="⇄ MODE I", fg_color=STEEL,
                           hover_color=STEEL_LIGHT)
     except Exception:
         pass
@@ -2592,16 +2607,22 @@ def _split_replaces_vocals():
     # Un-mute the two halves. They were muted when the stems landed, back
     # when they held nothing; without this they stay silent and the split
     # looks as though it produced nothing at all.
-    manual = _manual_split[0]
-    _manual_split[0] = False
-    if state.vocals_lq and not manual:
-        # An automatic split (one already under way when LQ was chosen) was
-        # made from the HQ vocal: keep it for when LQ is turned off.
+    made_for_lq = _split_source[0] == "lq"
+    if made_for_lq != bool(state.vocals_lq):
+        # The mode changed while this split ran: file it under the mode it
+        # was made for, and put back what the current mode had.
         with audio_lock:
-            _halves_hq[0] = (state.fv_data, state.bg_vocals_data)
-            state.fv_data = None
-            state.bg_vocals_data = None
-        return
+            done = (state.fv_data, state.bg_vocals_data)
+            if made_for_lq:
+                _halves_lq[0] = done
+                state.fv_data, state.bg_vocals_data = _halves_hq[0] or (None, None)
+                _halves_hq[0] = None
+            else:
+                _halves_hq[0] = done
+                state.fv_data, state.bg_vocals_data = _halves_lq[0] or (None, None)
+                _halves_lq[0] = None
+        if state.fv_data is None and state.bg_vocals_data is None:
+            return
     _swap_to_split_vocals()
 
     # VOCALS carries no audio from here, so its own mute must be clear: as
@@ -3213,6 +3234,8 @@ def separate_bg_vocals(into=None, cancel=None, src_override=None, progress=None)
             _kara_separating = False
         return
 
+    if not bg:
+        _split_source[0] = "lq" if state.vocals_lq else "hq"
     src = None
     if src_override is not None:
         src = src_override          # LOAD FIRST: the refined vocals directly
@@ -3226,6 +3249,11 @@ def separate_bg_vocals(into=None, cancel=None, src_override=None, progress=None)
         if not bg:
             _kara_separating = False
         return
+    else:
+        # A copy taken now: switching Mode I / Mode II rewrites the VOCALS
+        # stem in place, and a split still running would otherwise read the
+        # other vocal halfway through.
+        src = np.array(src, dtype=np.float32, copy=True)
 
     if not bg:
         _fg_enter("karaoke split")
@@ -6467,10 +6495,6 @@ def _run_post_stem_chains(path, cancel):
             print("[Karaoke] AUTO SEPARATE is off — press SEPARATE NOW to "
                   "split the vocals")
             return
-        if state.vocals_lq:
-            print("[Karaoke] LQ VOCAL is on, so karaoke is off — press "
-                  "SEPARATE NOW to split the LQ vocal")
-            return
         if not cancel.is_set():
             separate_bg_vocals(cancel=cancel)
             report_split_result()
@@ -6896,6 +6920,7 @@ def _unload_track_extras(cancel_bed=True):
     _vocals_6stem[0] = None
     _vocals_hq[0] = None
     _halves_hq[0] = None
+    _halves_lq[0] = None
     if running:
         app.after(0, _paint_lq_button)
     # The mixer reset (when KEEP MIX SETTINGS is off) waits for the new song
@@ -10907,9 +10932,8 @@ def _bgv_separate_now():
         return
     def _resplit():
         _lower_thread_priority()
-        _manual_split[0] = True
         if state.vocals_lq:
-            print("[Karaoke] Splitting the LQ vocal, as asked")
+            print("[Karaoke] Splitting the six-stem vocal")
         separate_bg_vocals()
     threading.Thread(target=_resplit, daemon=True).start()
     if running:
@@ -13236,7 +13260,7 @@ def _vocals_status_tick():
 _voc_model_wrap = _vocals_sub_ref[0] if _vocals_sub_ref[0] is not None \
     else _vocals_hdr_ref[0]
 
-_lq_btn = ctk.CTkButton(_vocals_cell, text="⇄ LQ 6-STEM VOCAL",
+_lq_btn = ctk.CTkButton(_vocals_cell, text="⇄ MODE I",
                         command=_toggle_lq_vocals,
                         fg_color=STEEL, hover_color=STEEL_LIGHT,
                         text_color=TEXT_MAIN,
