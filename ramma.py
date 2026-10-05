@@ -1272,7 +1272,7 @@ def add_model_picker(cell, role, after=None):
 # beside this file; list tips.txt in _UPDATE_FILES and your edits reach
 # everyone with the next update.
 # ============================================================
-_TIPS_EDITOR_HASH = ""
+_TIPS_EDITOR_HASH = "4b22cc2644f3e1c4889cef71fba9fcf2c7fe95ac5d827bff0f4556191a29c9c2"
 _TIPS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tips.txt")
 _TIPS_DEFAULT = ("No tips yet.\n\nThe author of this copy of RAMMA can add "
                  "some with the EDIT button.")
@@ -1335,7 +1335,7 @@ _UPDATE_FILES  = [
     # "requirements.txt",
     # "RAMMA.bat",
     "models.json",
-    "tips.txt",     # uncomment once tips.txt is in your repository
+    # "tips.txt",     # uncomment once tips.txt is in your repository
 ]
 _UPDATE_CHECK  = True          # look for updates at start-up
 _UPDATE_ASK    = True          # ask before installing; False installs quietly
