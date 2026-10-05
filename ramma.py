@@ -202,7 +202,7 @@ class LockedSlider(ctk.CTkSlider):
 
 
 app = ctk.CTk()
-app.title("R·A·M·M·A - STEM ENGINE v0.667.1")
+app.title("R·A·M·M·A - STEM ENGINE v0.667.2")
 app.configure(fg_color=BG)
 app.resizable(True, True)
 
@@ -375,8 +375,6 @@ def _splash_set(frac, label):
     _sp_fit(_sp_status, allow_wrap=False)
     _splash.update_idletasks()
 
-def _splash_advance(stage_name, frac):
-    app.after(0, lambda: _splash_set(frac, stage_name))
 
 # Mark imports done
 _splash_set(0.15, "IMPORTS READY")
@@ -474,10 +472,6 @@ _OVERLAP_SECONDS = 0.25
 # How much audio to push through the model in one forward pass. The batch is
 # derived from this so changing the chunk length doesn't change VRAM use.
 _BATCH_SECONDS = 36.0
-
-# The instrumental model returns one stem instead of six, so its activations
-# and its output are far smaller — it can take a bigger bite per pass.
-_INST_BATCH_FACTOR = 2.0
 
 # Chunks quieter than this are silence (lead-ins, gaps, fade-outs); they are
 # written as zeros instead of being pushed through the model.
@@ -670,6 +664,56 @@ def _chunking_from_config(cfg, sr, fallback_chunk=None):
     return chunk_s, overlap_s
 
 
+class _BatchProbe:
+    """Start a pass with one chunk, measure it, size the rest to fit.
+
+    Guessing a batch size from free memory alone cannot know how hungry a
+    given model is per chunk: unwa's model on 17-second chunks needs far
+    more than a karaoke model on 8-second ones. So the first batch is a
+    single chunk, its peak memory is measured, and later batches use as
+    many chunks as fit in 60% of what is free — never more than the cap
+    from _batch_size_for, and never growing back after an out-of-memory.
+    """
+
+    def __init__(self, run_device, cap, tag="Pass"):
+        self.dev = run_device
+        self.cap = max(1, int(cap))
+        self.tag = tag
+        self.done = False
+        self.base = None
+
+    def start(self):
+        if getattr(self.dev, "type", "cpu") != "cuda":
+            self.done = True
+            return self.cap
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            self.base = torch.cuda.memory_allocated()
+        except Exception:
+            self.done = True
+            return min(self.cap, 2)
+        return 1
+
+    def after(self, batch_n):
+        if self.done:
+            return batch_n
+        self.done = True
+        try:
+            torch.cuda.synchronize()
+            per_chunk = max(1, torch.cuda.max_memory_allocated() - self.base)
+            free, _total = torch.cuda.mem_get_info()
+            # Memory PyTorch already holds in its cache is reusable too.
+            avail = free + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+            fit = int((avail * 0.6) // per_chunk)
+            n = max(1, min(self.cap, fit))
+            print(f"[{self.tag}] One chunk needed {per_chunk / 2**30:.2f} GB; "
+                  f"{avail / 2**30:.1f} GB available -> {n} chunk(s) per batch")
+            return n
+        except Exception:
+            return min(self.cap, 2)
+
+
 def _batch_size_for(run_device, chunk_seconds=None):
     """Chunks per forward pass, scaled to the VRAM actually free.
 
@@ -682,6 +726,12 @@ def _batch_size_for(run_device, chunk_seconds=None):
         return 1
     chunk_seconds = chunk_seconds or _CHUNK_SECONDS
 
+    # An upper limit only — each pass then measures what one chunk really
+    # takes and fits its batches to that (see _BatchProbe). The old "roomy
+    # card" boost asked for up to six 17-second chunks at once (over 100 s
+    # of audio); with VRAM no longer full of idle models it actually got
+    # them, overflowed the card, and on Windows the driver spilled into
+    # system RAM instead of failing — the pass crawled and sat at 8%.
     budget = _BATCH_SECONDS
     free = _free_vram_gb()
     if free is not None:
@@ -689,15 +739,7 @@ def _batch_size_for(run_device, chunk_seconds=None):
             budget = min(budget, chunk_seconds)          # one chunk at a time
         elif free < 3.0:
             budget = min(budget, chunk_seconds * 2)
-        elif free < 5.0:
-            budget = min(budget, chunk_seconds * 3)
-        elif free >= 10.0:
-            # Plenty spare: larger batches keep the card busier between
-            # kernel launches. Still bounded, and an OOM halves it anyway.
-            budget = max(budget, chunk_seconds * 6)
-        elif free >= 7.0:
-            budget = max(budget, chunk_seconds * 4)
-    return max(1, int(budget / max(1.0, chunk_seconds)))
+    return max(1, min(4, int(budget / max(1.0, chunk_seconds))))
 
 
 # The stems pass and the instrumental pass read the same file. Decoding and
@@ -957,6 +999,31 @@ def _model_error_box(role, ckpt, cfg):
         pass
 
 
+_pending_kara_credit = [None]   # (title, author) shown once a split uses it
+
+
+def _resplit_with_new_model():
+    """After a karaoke model switch, split the vocals again with it.
+
+    If the halves were already made by the previous model, they are redone
+    straight away (after any split still in progress). If the song has not
+    reached its split yet, the pipeline's own split will use the new model,
+    so nothing extra is needed — the credit changes when that one lands.
+    """
+    if not state.stems or state.stems.get("vocals") is None:
+        return
+    if state.vocals_lq:
+        return                        # karaoke is off while LQ VOCAL is on
+    if state.fv_data is None and state.bg_vocals_data is None:
+        return                        # the pipeline's split will use it
+    while _kara_separating:
+        time.sleep(0.2)               # let a split already under way finish
+    print("[Karaoke] Re-splitting the vocals with the newly chosen model…")
+    _lower_thread_priority()
+    separate_bg_vocals()
+    report_split_result()
+
+
 def _apply_model_choice(role, ckpt, cfg):
     """Point a role at a different checkpoint and load it again."""
     prev = _model_paths(role)
@@ -993,13 +1060,23 @@ def _apply_model_choice(role, ckpt, cfg):
     else:
         return
 
-    _set_model_credit(role, title, author)
+    vocal_there = bool(state.stems) and state.stems.get("vocals") is not None
+    if role == "karaoke" and vocal_there:
+        # The credit names the model that made what you hear, so it waits
+        # until a split with the new model has finished.
+        _pending_kara_credit[0] = (title, author)
+    else:
+        _set_model_credit(role, title, author)
 
     def _load_and_check():
         loader()
         if _role_model(role) is not None:
             print(f"[Models] {role}: {os.path.basename(ckpt)} loaded")
+            if role == "karaoke":
+                _resplit_with_new_model()
             return
+        if role == "karaoke":
+            _pending_kara_credit[0] = None
         # The loader prints why; put the previous model back so the cell is
         # not left with nothing, and say plainly that the file did not fit.
         print(f"[Models] {role}: {os.path.basename(ckpt)} could not be used — "
@@ -1266,14 +1343,6 @@ _UPDATE_STATE  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "ramma_update.json")
 
 
-def _update_state():
-    try:
-        with open(_UPDATE_STATE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
 def _save_update_state(data):
     try:
         with open(_UPDATE_STATE, "w", encoding="utf-8") as f:
@@ -1305,11 +1374,6 @@ def _github_commit_info():
     except Exception:
         pass
     return "", ""
-
-
-def _download_update(repo_path=None):
-    """Fetch one file from the branch; returns its text."""
-    return _download_bytes(repo_path or _UPDATE_FILE).decode("utf-8")
 
 
 def _download_bytes(repo_path):
@@ -1344,11 +1408,6 @@ def _update_targets():
 def _bytes_hash(data):
     import hashlib
     return hashlib.sha256(data).hexdigest()
-
-
-def _text_hash(text):
-    import hashlib
-    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
 
 def install_files(changed):
@@ -1391,36 +1450,6 @@ def install_files(changed):
                         "installed": time.strftime("%Y-%m-%d %H:%M:%S")})
     print(f"[Update] Installed {len(written)} file(s): {', '.join(written)}. "
           f"Previous versions kept as .bak — restart RAMMA to use them.")
-    return True
-
-
-def install_update(new_hash, text):
-    """Replace this file with *text*, keeping the current one as a backup."""
-    me = os.path.abspath(__file__)
-    # Refuse anything that will not compile or is obviously truncated.
-    if len(text) < 10000:
-        print(f"[Update] The download is only {len(text)} bytes — ignoring it.")
-        return False
-    try:
-        compile(text, me, "exec")
-    except SyntaxError as e:
-        print(f"[Update] The downloaded file does not compile ({e}); "
-              f"keeping the current one.")
-        return False
-
-    backup = me + ".bak"
-    try:
-        shutil.copy2(me, backup)
-        with open(me, "w", encoding="utf-8") as f:
-            f.write(text)
-    except Exception as e:
-        print("[Update] Could not write the update:", e)
-        return False
-
-    _save_update_state({"hash": new_hash,
-                        "installed": time.strftime("%Y-%m-%d %H:%M:%S")})
-    print(f"[Update] Installed. The previous version is at "
-          f"{os.path.basename(backup)} — restart RAMMA to use the new one.")
     return True
 
 
@@ -1877,9 +1906,6 @@ def _voc_find_files():
 _STR_AUTO   = True        # run the strings model after every track
 _STR_FIRST  = False       # run it before the six-stem pass, so the strings
                           # are playable sooner (the stems then follow)
-_STR_QUICK  = True        # fill the cell from OTHER until the model has run,
-                          # exactly as the instrumental cell does. No switch:
-                          # it costs nothing and is replaced by the model.
 _STR_TITLE  = "BOWED STRINGS"
 _STR_CREDIT = "by gilliaan"
 
@@ -1957,7 +1983,7 @@ _KARA_CFG_PATH  = ""
 _KARA_NAME_HINTS   = ("karaoke", "kara")
 # Which karaoke model is used when several are installed, most wanted first.
 # Anything not listed comes after these, alphabetically.
-_KARA_PREFER       = ("gabox", "becruily", "aufr33")
+_KARA_PREFER       = ("becruily", "gabox", "aufr33")
 _KARA_AUTO         = True    # split into FRT VOX + BG VOX after every track
 _KARA_FIRST        = False   # do the split before the six-stem pass
 _kara_done_first   = [False] # the split already ran first for this load
@@ -1991,7 +2017,7 @@ def set_gpu_mode():
         return
     device = torch.device("cuda" if gpu_var.get() and torch.cuda.is_available() else "cpu")
     if model is not None:
-        model.to(device)
+        model.to("cpu")
     if inst_model is not None:
         inst_model.to(device)
 
@@ -2148,7 +2174,7 @@ def load_model():
         if isinstance(state_dict, dict) and 'state_dict' in state_dict:
             state_dict = state_dict['state_dict']
         m.load_state_dict(state_dict)
-        m.to(device)
+        m.to("cpu")      # parked in RAM; moved to the GPU only for its pass
         m.eval()
         model = m   # only expose the model once it is fully loaded
         print(f'[BS-RoFormer] Model ready on {device}')
@@ -2327,7 +2353,7 @@ def load_inst_model():
             except Exception:
                 pass
 
-            m.to(device)
+            m.to("cpu")      # parked in RAM; moved to the GPU only for its pass
             m.eval()
             inst_model = m
             print(f"[Inst] Model ready on {device} "
@@ -2344,6 +2370,7 @@ def load_inst_model():
 # and those five all audible the backing track plays twice over, so bringing
 # INSTRUM in mutes them, and taking it out again restores them.
 _INST_OVERLAP     = ("drums", "bass", "guitar", "piano", "other")
+_INST_CHILDREN    = _INST_OVERLAP + ("strings",)   # what INST controls as a VCA
 _inst_muted_by_us = set()   # stems muted on INSTRUM's behalf, to restore later
 
 
@@ -2353,8 +2380,11 @@ def _sync_instrumental_overlap():
     Only stems muted here are un-muted later: a stem you had muted yourself
     before bringing INSTRUM in stays muted when INSTRUM goes out again.
     """
-    inst_on = (state.instrumental is not None
-               and not state.stem_mute.get("instrumental", False))
+    if getattr(state, "inst_is_vca", False):
+        inst_on = False      # INST is a control now; nothing to double
+    else:
+        inst_on = (state.instrumental is not None
+                   and not state.stem_mute.get("instrumental", False))
     if inst_on:
         for _k in _INST_OVERLAP:
             if not state.stem_mute.get(_k, False):
@@ -2469,6 +2499,88 @@ def _restore_vocals_mute():
         pass
 
 
+_vocals_6stem = [None]   # the six-stem model's own vocal, untouched
+_vocals_hq    = [None]   # the HQ vocal, set aside while LQ VOCAL is on
+_halves_hq    = [None]   # (FRT, BG) made from the HQ vocal, set aside likewise
+_manual_split = [False]  # the split under way was asked for with SEPARATE NOW
+
+
+def _toggle_lq_vocals():
+    """Switch the VOCALS cell between the HQ vocal and the six-stem one.
+
+    LQ: VOCALS plays the original six-stem vocal as an ordinary cell, and
+    FRT/BG VOX (made from the HQ vocal) are muted so nothing is doubled.
+    Back to HQ: the HQ vocal returns and, if the split exists, VOCALS is the
+    VCA over FRT/BG VOX again.
+    """
+    if not state.stems or state.stems.get("vocals") is None:
+        print("[Vocals] Load a song first")
+        return
+    v = state.stems["vocals"]
+    if not state.vocals_lq:
+        if _vocals_6stem[0] is None:
+            print("[Vocals] The original six-stem vocal is not available for "
+                  "this song (its stems came from saved files)")
+            return
+        with audio_lock:
+            _vocals_hq[0] = v.copy()
+            n = min(len(v), len(_vocals_6stem[0]))
+            v[:n] = _vocals_6stem[0][:n]
+            state.vocals_lq = True
+            state.vocals_is_vca = False
+            # Karaoke off: the halves were made from the HQ vocal, so they are
+            # set aside entirely (not just muted) — nothing can double the LQ
+            # vocal. SEPARATE NOW on FRT/BG VOX splits the LQ vocal instead.
+            _halves_hq[0] = (state.fv_data, state.bg_vocals_data)
+            state.fv_data = None
+            state.bg_vocals_data = None
+            state.stem_mute["vocals"] = False
+        print("[Vocals] LQ VOCAL: playing the original six-stem vocal; karaoke "
+              "is off (SEPARATE NOW on FRT/BG VOX splits the LQ vocal)")
+    else:
+        with audio_lock:
+            if _vocals_hq[0] is not None:
+                n = min(len(v), len(_vocals_hq[0]))
+                v[:n] = _vocals_hq[0][:n]
+            state.vocals_lq = False
+            # The HQ halves come back; any split of the LQ vocal is dropped.
+            fv, bg = _halves_hq[0] or (None, None)
+            _halves_hq[0] = None
+            state.fv_data, state.bg_vocals_data = fv, bg
+            halves = fv is not None or bg is not None
+            state.vocals_is_vca = halves
+            if halves:
+                state.stem_mute["front_vocals"] = False
+                state.stem_mute["bg_vocals"] = False
+                state.stem_mute["vocals"] = False
+        print("[Vocals] Back to the HQ vocal")
+    for _k in ("vocals", "front_vocals", "bg_vocals"):
+        try:
+            _paint_ms(_k)
+        except (NameError, KeyError):
+            pass
+    _paint_lq_button()
+    try:
+        _update_vocals_status()
+    except Exception:
+        pass
+
+
+def _paint_lq_button():
+    btn = globals().get("_lq_btn")
+    if btn is None:
+        return
+    try:
+        if state.vocals_lq:
+            btn.configure(text="⇄ BACK TO HQ VOCAL", fg_color="#7a3d00",
+                          hover_color="#a35200")
+        else:
+            btn.configure(text="⇄ LQ 6-STEM VOCAL", fg_color=STEEL,
+                          hover_color=STEEL_LIGHT)
+    except Exception:
+        pass
+
+
 def _split_replaces_vocals():
     """Hand the vocal over to FRT VOX + BG VOX.
 
@@ -2480,6 +2592,16 @@ def _split_replaces_vocals():
     # Un-mute the two halves. They were muted when the stems landed, back
     # when they held nothing; without this they stay silent and the split
     # looks as though it produced nothing at all.
+    manual = _manual_split[0]
+    _manual_split[0] = False
+    if state.vocals_lq and not manual:
+        # An automatic split (one already under way when LQ was chosen) was
+        # made from the HQ vocal: keep it for when LQ is turned off.
+        with audio_lock:
+            _halves_hq[0] = (state.fv_data, state.bg_vocals_data)
+            state.fv_data = None
+            state.bg_vocals_data = None
+        return
     _swap_to_split_vocals()
 
     # VOCALS carries no audio from here, so its own mute must be clear: as
@@ -2554,22 +2676,6 @@ def _resample_to(audio, from_sr, to_sr):
         _rp(audio[:, 0], up, down).astype(np.float32),
         _rp(audio[:, 1], up, down).astype(np.float32),
     ], axis=1)
-
-
-def _quick_strings(stems):
-    """A stand-in strings part, taken from the six-stem split.
-
-    Bowed strings mostly land in OTHER (with some in GUITAR), so that is
-    what fills the cell the moment the stems arrive — something to hear and
-    mix with straight away. gilliaan's model replaces it when its pass
-    finishes, exactly as unwa's model replaces the quick instrumental.
-    """
-    if not stems:
-        return None
-    part = stems.get("other")
-    if part is None:
-        return None
-    return part.copy()
 
 
 def _quick_instrumental(stems):
@@ -2681,6 +2787,80 @@ def _best_config_for(ckpt, yamls):
         return total
 
     return max(sorted(yamls), key=score)
+
+
+def _alias_msst_imports():
+    """Let ZFTurbo's mel_band_roformer.py import "models.bs_roformer.*".
+
+    That file is written for the MSST repository layout. Pointing those
+    names at the installed bs_roformer package means it imports as-is.
+    """
+    try:
+        import importlib
+        import bs_roformer as _bsr_pkg
+        if "models" not in sys.modules:
+            _shim = types.ModuleType("models")
+            _shim.__path__ = []
+            sys.modules["models"] = _shim
+        sys.modules.setdefault("models.bs_roformer", _bsr_pkg)
+        setattr(sys.modules["models"], "bs_roformer", _bsr_pkg)
+        for _sub in ("attend", "bs_roformer"):
+            try:
+                sys.modules.setdefault(f"models.bs_roformer.{_sub}",
+                                       importlib.import_module(f"bs_roformer.{_sub}"))
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[Models] Could not alias the MSST import path: {e}")
+
+
+def _build_roformer(cfg, is_mel, sr, tag="Models", report=True):
+    """Build the model a config describes — BS-RoFormer or Mel-Band.
+
+    bs-roformer-infer only knows the BS-RoFormer architecture, so asking it
+    for a Mel-Band model fails. The karaoke loader always built Mel-Band
+    models itself; the vocals and strings loaders did not, so becruily's
+    vocals model (Mel-Band) never loaded and the VOCALS cell kept the six-
+    stem vocal. Every loader now builds through here.
+    """
+    if not is_mel:
+        get_model_from_config = _import_bs_roformer()["get_model_from_config"]
+        m = get_model_from_config("bs_roformer", cfg)
+        if m is None:
+            raise RuntimeError("get_model_from_config returned None")
+        return m
+    _alias_msst_imports()
+    try:
+        from bs_roformer.mel_band_roformer import MelBandRoformer
+    except ImportError as ie:
+        raise RuntimeError(
+            "bs_roformer.mel_band_roformer is missing. bs-roformer-infer ships "
+            "only the BS-RoFormer architecture, so a Mel-Band model cannot be "
+            "built. Copy mel_band_roformer.py (and attend.py if needed) into "
+            "the installed bs_roformer folder — do NOT pip install BS-RoFormer "
+            f"over it. Original error: {ie}") from ie
+    import inspect
+    accepted = set(inspect.signature(MelBandRoformer.__init__).parameters)
+    kw, dropped = {}, []
+    for k, v in dict(cfg.model).items():
+        if k in accepted:
+            kw[k] = tuple(v) if isinstance(v, list) else v
+        else:
+            dropped.append(k)
+    shape_keys = [k for k in dropped if k in (
+        "mlp_expansion_factor", "num_stems", "num_bands", "dim", "depth",
+        "mask_estimator_depth", "skip_connection")]
+    if report and shape_keys:
+        print(f"[{tag}] ⚠ Your mel_band_roformer.py does not accept "
+              f"{', '.join(shape_keys)} — it is older than this model needs, "
+              f"and those settings are being ignored. Replace it with the "
+              f"current mel_band_roformer.py from ZFTurbo's "
+              f"Music-Source-Separation-Training repository.")
+    if "sample_rate" in accepted:
+        kw.setdefault("sample_rate", sr)
+    if "flash_attn" in accepted:
+        kw["flash_attn"] = bool(torch.cuda.is_available()) and not _SAFE_MODE
+    return MelBandRoformer(**kw)
 
 
 def load_kara_model():
@@ -2892,7 +3072,7 @@ def load_kara_model():
             if _kara_back_idx is None:
                 _kara_back_idx = 1   # karaoke models put the backing second
 
-            m.to(device)
+            m.to("cpu")      # parked in RAM; moved to the GPU only for its pass
             m.eval()
             kara_model = m
             print(f"[Karaoke] Model ready on {device} ({_kara_sr} Hz, "
@@ -3005,7 +3185,7 @@ def _orient_halves(lead, back):
     return lead, back
 
 
-def separate_bg_vocals(into=None, cancel=None, src_override=None):
+def separate_bg_vocals(into=None, cancel=None, src_override=None, progress=None):
     """Split the separated vocals into lead and backing, keeping both.
 
     Runs on state.stems["vocals"] — the karaoke model only has to look at the
@@ -3049,6 +3229,7 @@ def separate_bg_vocals(into=None, cancel=None, src_override=None):
 
     if not bg:
         _fg_enter("karaoke split")
+        _model_on_gpu(kara_model)
     else:
         _bg_wait_for_foreground(cancel)
         if cancel is not None and cancel.is_set():
@@ -3077,11 +3258,15 @@ def separate_bg_vocals(into=None, cancel=None, src_override=None):
 
         starts   = list(range(0, n_samples, step_n))
         n_chunks = len(starts)
-        batch_n  = _batch_size_for(run_device, chunk_n / sr_i)
+        _probe = _BatchProbe(run_device, _batch_size_for(run_device, chunk_n / sr_i), "Karaoke")
+        batch_n = _probe.start()
         use_fp16 = _INFER_FP16
 
         def _split_upd(v):
-            if not bg and running:
+            if bg:
+                if progress is not None:
+                    progress(v)      # result-only mode: e.g. an ATMOS track
+            elif running:
                 app.after(0, lambda: _set_split_progress(v))
 
         _split_upd(0.02)
@@ -3166,11 +3351,12 @@ def separate_bg_vocals(into=None, cancel=None, src_override=None):
                             lead_np[bi, :, :actual].T * w[:, None]
                     wgt[start:start + actual]      += w
                 ci += len(batch_starts)
+                batch_n = _probe.after(batch_n)   # fit batches to the card
                 _split_upd(min(0.99, ci / max(1, n_chunks)))
 
         wgt = np.maximum(wgt, 1e-8)
         if run_device.type != device.type:
-            kara_model.to(device)
+            kara_model.to("cpu")
         out_back /= wgt[:, None]
         out_lead /= wgt[:, None]
         have_lead = bool(np.any(out_lead))
@@ -3246,6 +3432,11 @@ def separate_bg_vocals(into=None, cancel=None, src_override=None):
             state.fv_sr   = sr_now
         print(f"[Karaoke] FRT VOX: {'filled' if have_lead else 'empty'} | "
               f"BG VOX: filled — the VOCALS stem is muted in their favour")
+        _pc = _pending_kara_credit[0]
+        if _pc is not None:
+            _pending_kara_credit[0] = None
+            if running:
+                app.after(0, lambda t=_pc[0], a=_pc[1]: _set_model_credit("karaoke", t, a))
         if running:
             app.after(0, _split_replaces_vocals)
             app.after(0, _update_bgv_button)
@@ -3256,6 +3447,7 @@ def separate_bg_vocals(into=None, cancel=None, src_override=None):
         traceback.print_exc()
     finally:
         if not bg:
+            _model_off_gpu(kara_model)
             _fg_leave()
             _kara_separating = False
             if running:
@@ -3287,7 +3479,7 @@ def load_strings_model():
 
             import yaml
             _bsr = _import_bs_roformer()
-            get_model_from_config = _bsr["get_model_from_config"]
+            pass  # models are built by _build_roformer
             _YL = _bsr["yaml_loader"]
             from ml_collections import ConfigDict
             with open(cfg_path, "r", encoding="utf-8") as f:
@@ -3308,25 +3500,9 @@ def load_strings_model():
             if is_mel and not _ensure_librosa():
                 print("[Models] Mel-Band model without librosa — trying the "
                       "built-in filterbank rather than refusing outright.")
-            arch = "mel_band_roformer" if is_mel else "bs_roformer"
-            if is_mel:
-                # ZFTurbo's mel_band_roformer.py imports models.bs_roformer;
-                # point that at the installed package (as the karaoke loader
-                # does) so the import resolves.
-                try:
-                    import bs_roformer as _bsr_pkg
-                    if "models" not in sys.modules:
-                        _shim = types.ModuleType("models")
-                        _shim.__path__ = []
-                        sys.modules["models"] = _shim
-                    sys.modules.setdefault("models.bs_roformer", _bsr_pkg)
-                    setattr(sys.modules["models"], "bs_roformer", _bsr_pkg)
-                except Exception:
-                    pass
-
-            m = get_model_from_config(arch, str_cfg)
-            if m is None:
-                raise RuntimeError("get_model_from_config returned None")
+            print(f"[Strings] Building a {'Mel-Band' if is_mel else 'BS'}-RoFormer "
+                  f"from {os.path.basename(cfg_path)}")
+            m = _build_roformer(str_cfg, is_mel, _str_sr, "Strings")
 
             sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             if isinstance(sd, dict) and "state_dict" in sd:
@@ -3349,7 +3525,7 @@ def load_strings_model():
             except Exception:
                 pass
 
-            m.to(device)
+            m.to("cpu")      # parked in RAM; moved to the GPU only for its pass
             m.eval()
             strings_model = m
             print(f"[Strings] Model ready on {device} ({_str_sr} Hz, "
@@ -3377,7 +3553,7 @@ def load_vocals_model():
 
             import yaml
             _bsr = _import_bs_roformer()
-            get_model_from_config = _bsr["get_model_from_config"]
+            pass  # models are built by _build_roformer
             _YL = _bsr["yaml_loader"]
             from ml_collections import ConfigDict
             with open(cfg_path, "r", encoding="utf-8") as f:
@@ -3398,22 +3574,9 @@ def load_vocals_model():
             if is_mel and not _ensure_librosa():
                 print("[Models] Mel-Band model without librosa — trying the "
                       "built-in filterbank rather than refusing outright.")
-            if is_mel:
-                try:
-                    import bs_roformer as _bsr_pkg
-                    if "models" not in sys.modules:
-                        _shim = types.ModuleType("models")
-                        _shim.__path__ = []
-                        sys.modules["models"] = _shim
-                    sys.modules.setdefault("models.bs_roformer", _bsr_pkg)
-                    setattr(sys.modules["models"], "bs_roformer", _bsr_pkg)
-                except Exception:
-                    pass
-            arch = "mel_band_roformer" if is_mel else "bs_roformer"
-
-            m = get_model_from_config(arch, voc_cfg)
-            if m is None:
-                raise RuntimeError("get_model_from_config returned None")
+            print(f"[Vocals] Building a {'Mel-Band' if is_mel else 'BS'}-RoFormer "
+                  f"from {os.path.basename(cfg_path)}")
+            m = _build_roformer(voc_cfg, is_mel, _voc_sr, "Vocals")
 
             sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             if isinstance(sd, dict) and "state_dict" in sd:
@@ -3435,7 +3598,7 @@ def load_vocals_model():
             except Exception:
                 pass
 
-            m.to(device)
+            m.to("cpu")      # parked in RAM; moved to the GPU only for its pass
             m.eval()
             vocals_model = m
             print(f"[Vocals] Model ready on {device} ({_voc_sr} Hz, "
@@ -3445,7 +3608,7 @@ def load_vocals_model():
         vocals_model_ready = True
 
 
-def refine_vocals(path, cancel=None):
+def refine_vocals(path, cancel=None, into=None, progress=None):
     """Run the vocals model over the MAIN TRACK and replace the VOCALS stem.
 
     Deliberately takes the original file rather than the six-stem vocals:
@@ -3462,6 +3625,7 @@ def refine_vocals(path, cancel=None):
 
     _vocals_refining = True
     _fg_enter("vocals model")
+    _model_on_gpu(vocals_model)
     if running:
         app.after(0, _update_vocals_status)
     try:
@@ -3482,7 +3646,8 @@ def refine_vocals(path, cancel=None):
         out = np.zeros((2, n_samples), dtype=np.float32)
         wgt = np.zeros(n_samples, dtype=np.float32)
         starts  = list(range(0, n_samples, step_n))
-        batch_n = _batch_size_for(device, chunk_n / sr_i)
+        _probe = _BatchProbe(device, _batch_size_for(device, chunk_n / sr_i), "Vocals")
+        batch_n = _probe.start()
         use_fp16 = _INFER_FP16
         run_device = device
         ci = 0
@@ -3539,17 +3704,29 @@ def refine_vocals(path, cancel=None):
                     wgt[st_i:st_i + actual]    += w
                 ci += len(batch_starts)
                 i  += len(batch_starts)
-                if running:
+                batch_n = _probe.after(batch_n)   # fit batches to the card
+                if progress is not None:
+                    progress(min(0.99, ci / max(1, len(starts))))
+                elif running:
                     app.after(0, lambda v=min(0.99, ci / max(1, len(starts))):
                               _set_vocals_progress(v))
 
         np.divide(out, np.maximum(wgt, 1e-8)[None, :], out=out)
         if run_device.type != device.type:
-            vocals_model.to(device)
+            vocals_model.to("cpu")
         refined = np.ascontiguousarray(out.T)
+        if into is not None:
+            into["vocals"] = refined      # result-only: e.g. an ATMOS track
+            return True
         # Kept here too: with LOAD FIRST the split runs on this before the
         # six stems — and so the VOCALS cell — exist.
         _last_refined[0] = refined
+        if state.vocals_lq:
+            # LQ VOCAL is on: keep the HQ vocal aside for when it is turned off.
+            _vocals_hq[0] = refined
+            state.vocals_refined = True
+            print("[Vocals] HQ vocal ready — kept aside while LQ VOCAL is on")
+            return True
         with audio_lock:
             if state.stems:
                 n = min(len(refined), state.stems["vocals"].shape[0])
@@ -3566,6 +3743,7 @@ def refine_vocals(path, cancel=None):
         print(f"[Vocals] Separation error: {e}")
         return False
     finally:
+        _model_off_gpu(vocals_model)
         _fg_leave()
         _vocals_refining = False
         if running:
@@ -3573,7 +3751,28 @@ def refine_vocals(path, cancel=None):
             app.after(0, _update_vocals_status)
 
 
-def separate_strings(path=None, cancel=None):
+_other_full = [None]   # OTHER as separated, before the strings came out
+
+
+def _subtract_strings_from_other(strings):
+    """OTHER becomes the full OTHER minus the strings (call under audio_lock).
+
+    Always from the full OTHER, so it is right however many times it runs —
+    after a SEPARATE NOW, after the re-stem replaces OTHER, or after the
+    chain's own strings pass.
+    """
+    other = state.stems["other"]
+    full = _other_full[0]
+    if full is None or len(full) != len(other):
+        full = other.copy()
+        _other_full[0] = full
+    n = min(len(other), len(strings))
+    other[:n] = full[:n] - strings[:n]
+    if n < len(other):
+        other[n:] = full[n:]
+
+
+def separate_strings(path=None, cancel=None, src=None, into=None, progress=None):
     """Pull the bowed strings out of the OTHER stem.
 
     The six-stem model has already set the strings aside in OTHER, so that
@@ -3589,16 +3788,24 @@ def separate_strings(path=None, cancel=None):
     if strings_model is None:
         print("[Strings] No model loaded — the STRINGS cell stays empty.")
         return
-    if not state.stems or state.stems.get("other") is None:
+    if src is None and (not state.stems or state.stems.get("other") is None):
         print("[Strings] No OTHER stem yet — nothing to take the strings from.")
         return
 
     _strings_separating = True
     _fg_enter("strings")
+    _model_on_gpu(strings_model)
     if running:
         app.after(0, _update_strings_status_label)
     try:
-        audio = np.asarray(state.stems["other"], dtype=np.float32).copy()
+        # Always the full OTHER (before any strings were taken out of it):
+        # separating an already-subtracted OTHER would find little, and
+        # subtracting again would hollow it out.
+        if src is not None:
+            full = src                    # given directly: e.g. an ATMOS track
+        else:
+            full = _other_full[0] if _other_full[0] is not None else state.stems["other"]
+        audio = np.asarray(full, dtype=np.float32).copy()
         sr_i = int(state.sr or _str_sr)
         x_full = audio.T.astype(np.float32)          # (2, N)
         n_samples = x_full.shape[1]
@@ -3616,7 +3823,8 @@ def separate_strings(path=None, cancel=None):
 
         starts   = list(range(0, n_samples, step_n))
         n_chunks = len(starts)
-        batch_n  = _batch_size_for(device, chunk_n / sr_i)
+        _probe = _BatchProbe(device, _batch_size_for(device, chunk_n / sr_i), "Strings")
+        batch_n = _probe.start()
         use_fp16 = _INFER_FP16
         run_device = device
         ci = 0
@@ -3674,24 +3882,27 @@ def separate_strings(path=None, cancel=None):
                     wgt[st_i:st_i + actual]    += w
                 ci += len(batch_starts)
                 i  += len(batch_starts)
-                if running:
+                batch_n = _probe.after(batch_n)   # fit batches to the card
+                if progress is not None:
+                    progress(min(0.99, ci / max(1, n_chunks)))
+                elif running:
                     app.after(0, lambda v=min(0.99, ci / max(1, n_chunks)):
                               _set_strings_progress(v))
 
         np.divide(out, np.maximum(wgt, 1e-8)[None, :], out=out)
         if run_device.type != device.type:
-            strings_model.to(device)
+            strings_model.to("cpu")
         strings = np.ascontiguousarray(out.T)
+        if into is not None:
+            into["strings"] = strings     # result-only: e.g. an ATMOS track
+            return
         with audio_lock:
             state.strings_data = strings
             state.strings_sr   = sr_i
-            state.strings_is_quick = False
             # OTHER becomes what is left once the strings are taken out —
             # the same as summing OTHER with an inverted copy of them.
             if state.stems and state.stems.get("other") is not None:
-                other = state.stems["other"]
-                n = min(len(other), len(strings))
-                other[:n] -= strings[:n]
+                _subtract_strings_from_other(strings)
                 print("[Strings] OTHER now holds what is left after the "
                       "strings were removed")
         el = time.time() - t0
@@ -3702,6 +3913,7 @@ def separate_strings(path=None, cancel=None):
     except Exception as e:
         print(f"[Strings] Separation error: {e}")
     finally:
+        _model_off_gpu(strings_model)
         _fg_leave()
         _strings_separating = False
         if running:
@@ -3709,7 +3921,7 @@ def separate_strings(path=None, cancel=None):
             app.after(0, _update_strings_button)
 
 
-def separate_inst(path, into=None, cancel=None, ui_progress=False):
+def separate_inst(path, into=None, cancel=None, ui_progress=False, progress=None):
     """Run BS-RoFormer Resurrection Inst on *path* in a background thread.
 
     Produces a stereo Instrumental stem and stores it in
@@ -3731,6 +3943,8 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
         """Report progress: on this cell always, and on the main bar when
         this pass is the whole job (instrumental-only mode)."""
         if bg:
+            if progress is not None:
+                progress(v)          # result-only mode: e.g. an ATMOS track
             return
         if running:
             app.after(0, lambda: _set_inst_progress(v))
@@ -3780,6 +3994,7 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
             return
     else:
         _fg_enter("instrumental")
+        _model_on_gpu(inst_model)
     try:
         print(f"[Inst] {'Pre-loading' if bg else 'Starting'} instrumental separation "
               f"of {os.path.basename(path)!r} ...")
@@ -3821,8 +4036,8 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
         n_chunks = len(starts)
 
         run_device = device
-        batch_n    = _batch_size_for(run_device,
-                                     (chunk_n / sr_i) / _INST_BATCH_FACTOR)
+        _probe     = _BatchProbe(run_device, _batch_size_for(run_device, chunk_n / sr_i), "Inst")
+        batch_n    = _probe.start()
         use_fp16   = _INFER_FP16
         _t_inst    = time.perf_counter()
         inst_model.eval()
@@ -3901,6 +4116,7 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
                     wgt[start:start + actual]      += w
 
                 ci += len(batch_starts)
+                batch_n = _probe.after(batch_n)   # fit batches to the card
                 _upd(min(0.99, 0.15 + 0.8 * ci / n_chunks))
                 pct = int(100 * ci / n_chunks)
                 if pct % 10 == 0 and not bg:
@@ -3909,7 +4125,7 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
         wgt = np.maximum(wgt, 1e-8)
         out_inst /= wgt[:, None]
         if run_device.type != device.type:
-            inst_model.to(device)       # ready on the GPU for the next track
+            inst_model.to("cpu")       # back to RAM until next time
 
         # 3. Back to the app's playback rate if the model used another one
         if sr_i != 44100:
@@ -3933,6 +4149,9 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
             into["instrumental"] = out_inst
             print(f"[Inst] Pre-loaded instrumental — {len(out_inst) / 44100:.1f} s")
             return
+        if ui_progress:
+            # INSTRUMENTAL ONLY: this is the new song taking over.
+            _apply_new_song_reset()
         state.instrumental = out_inst
         state.instrumental_is_quick = False
         print(f"[Inst] Instrumental ready — {len(out_inst) / 44100:.1f} s")
@@ -3963,6 +4182,7 @@ def separate_inst(path, into=None, cancel=None, ui_progress=False):
         _finish_ui()
     finally:
         if not bg:
+            _model_off_gpu(inst_model)
             _fg_leave()
             # Always take the cell's progress bar down. It used to be
             # cleared only on success (or in INSTRUMENTAL-ONLY mode), so an
@@ -4012,17 +4232,9 @@ class AppState:
     # ── master bus ────────────────────────────────────────────
     volume_master: float = 0.7
     stereo_width:  float = 1.0
-    reverb_master: float = 0.0   # master reverb wet mix
-    air_master:    float = 0.0   # master air boost/cut (0.0 = flat)
 
     # ── per-stem controls ─────────────────────────────────────
     stem_widths:  dict = dataclasses.field(default_factory=dict)  # key -> 0.0–2.0
-    stem_reverbs: dict = dataclasses.field(default_factory=dict)  # key -> 0.0–1.0
-    stem_air:     dict = dataclasses.field(default_factory=dict)  # key -> -1.0–1.0
-    # Cells whose polarity is flipped (Ø). Inverting one of a pair of cells
-    # that share material cancels what they have in common, which is how you
-    # hear what is only in one of them.
-    stem_invert: dict = dataclasses.field(default_factory=dict)
     stem_pan:     dict = dataclasses.field(default_factory=dict)  # key -> -1.0–1.0
     stem_mute:    dict = dataclasses.field(default_factory=dict)  # key -> bool
     stem_solo:    dict = dataclasses.field(default_factory=dict)  # key -> bool
@@ -4055,7 +4267,7 @@ class AppState:
     eq_bands: dict = dataclasses.field(default_factory=lambda: {
         k: [0] * 5 for k in [
             "vocals", "drums", "bass", "guitar", "piano", "other",
-            "any", "any+", "any++", "atmos_fl", "atmos_fr", "atmos_c", "atmos_lfe", "atmos_bl", "atmos_br",
+            "any", "strings", "atmos_front", "atmos_center", "atmos_rear",
             "front_vocals", "bg_vocals", "hidden_layer",
             "instrumental",
         ]
@@ -4084,7 +4296,6 @@ class AppState:
     bgv_vff_bkg_vol:   float            = 1.0
 
     hl_data:          Optional[object] = None
-    hl_sr:            Optional[int]    = None
     hl_volume:        float            = 1.0
     hl_vff_enabled:   bool             = False
     hl_vff_lead_cut:  float            = 0.5
@@ -4093,31 +4304,22 @@ class AppState:
     hl_vff_bkg_vol:   float            = 1.0
 
 
-    # ── ATMOS bed: the six channels of a 5.1 Atmos mix, imported as files ──
-    atmos_fl_data:   Optional[object] = None
-    atmos_fl_sr:     Optional[int]    = None
-    atmos_fl_volume: float            = 1.0
-    last_atmos_fl_dir: Optional[str]  = None
-    atmos_fr_data:   Optional[object] = None
-    atmos_fr_sr:     Optional[int]    = None
-    atmos_fr_volume: float            = 1.0
-    last_atmos_fr_dir: Optional[str]  = None
-    atmos_c_data:   Optional[object] = None
-    atmos_c_sr:     Optional[int]    = None
-    atmos_c_volume: float            = 1.0
-    last_atmos_c_dir: Optional[str]  = None
-    atmos_lfe_data:   Optional[object] = None
-    atmos_lfe_sr:     Optional[int]    = None
-    atmos_lfe_volume: float            = 1.0
-    last_atmos_lfe_dir: Optional[str]  = None
-    atmos_bl_data:   Optional[object] = None
-    atmos_bl_sr:     Optional[int]    = None
-    atmos_bl_volume: float            = 1.0
-    last_atmos_bl_dir: Optional[str]  = None
-    atmos_br_data:   Optional[object] = None
-    atmos_br_sr:     Optional[int]    = None
-    atmos_br_volume: float            = 1.0
-    last_atmos_br_dir: Optional[str]  = None
+
+    # ── ATMOS bed as three tracks: FRONT (FL + FR + LFE), CENTER (C),
+    #    REAR (BL + BR). The six single-channel fields above are kept only
+    #    so old sessions load; nothing plays from them any more.
+    atmos_front_data:   Optional[object] = None
+    atmos_front_volume: float            = 1.0
+    last_atmos_front_dir: Optional[str]  = None
+    atmos_center_data:   Optional[object] = None
+    atmos_center_volume: float            = 1.0
+    last_atmos_center_dir: Optional[str]  = None
+    atmos_rear_data:   Optional[object] = None
+    atmos_rear_volume: float            = 1.0
+    last_atmos_rear_dir: Optional[str]  = None
+    # Set once the bed has been separated: each track's six stems, kept
+    # apart so the ATMOS cells can pick which tracks the stems come from.
+    atmos_separated:    bool             = False
 
     # ── Bowed strings, from gilliaan's model ──────────────────────
     vocals_refined: bool             = False
@@ -4125,22 +4327,17 @@ class AppState:
     # Once the karaoke split has run, VOCALS carries no audio of its own:
     # its fader, M and S act on FRT VOX and BG VOX together.
     vocals_is_vca:  bool             = False
+    # Once the re-stem has run, the five backing stems come from unwa's
+    # instrumental, so INST carries no audio of its own: like VOCALS, it is
+    # then a control for them (and for STRINGS, which is taken from OTHER).
+    inst_is_vca:    bool             = False
+    vocals_lq:      bool             = False   # LQ VOCAL switch (see _toggle_lq_vocals)
     strings_data:   Optional[object] = None
-    strings_is_quick: bool           = False
     strings_sr:     Optional[int]    = None
     strings_volume: float            = 1.0
 
     any_data:    Optional[object] = None
-    any_sr:      Optional[int]    = None
     any_volume:  float            = 1.0
-
-    any_plus_data:   Optional[object] = None
-    any_plus_sr:     Optional[int]    = None
-    any_plus_volume: float            = 1.0
-
-    any_plusplus_data:    Optional[object] = None
-    any_plusplus_sr:      Optional[int]    = None
-    any_plusplus_volume:  float            = 1.0
 
     # ── export / session ──────────────────────────────────────
     export_folder:      Optional[str] = None
@@ -4151,7 +4348,10 @@ class AppState:
     # must be named after the audio they contain.
     loaded_audio_name: str            = ""
     _stem_export_state: dict = dataclasses.field(default_factory=dict)
-    export_fmt_wav24:   bool = True
+    export_fmt_flac16:  bool = True     # the default: lossless and compact
+    export_fmt_flac24:  bool = False
+    export_fmt_wav16:   bool = False
+    export_fmt_wav24:   bool = False
     export_fmt_mp3:     bool = False
     export_fmt_mp3_256: bool = False
 
@@ -4161,8 +4361,6 @@ class AppState:
     last_fv_dir:      Optional[str] = None
     last_hl_dir:      Optional[str] = None
     last_any_dir:          Optional[str] = None
-    last_any_plus_dir:     Optional[str] = None
-    last_any_plusplus_dir: Optional[str] = None
 
     # ── VFF — main vocals stem ────────────────────────────────
     vff_enabled:  bool  = False
@@ -4208,6 +4406,12 @@ _LIM_DEFAULTS  = dict(threshold=-6.0, ceiling=-0.1)
 # ----------------------------
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ramma_dirs.json")
 
+# AUTO-RESTART: when the track ends, start it again (on by default; the
+# choice is saved with the other settings). An A-B loop region always loops.
+# Defined here because _load_dirs() below restores it.
+_AUTO_RESTART = [True]
+
+
 def _load_dirs():
     try:
         with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -4221,15 +4425,21 @@ def _load_dirs():
         # are absent, so a settings file from before the rename keeps them.
         state.last_any_dir          = (data.get("last_any_dir")
                                        or data.get("last_synth_dir")   or None)
-        state.last_any_plus_dir     = (data.get("last_any_plus_dir")
-                                       or data.get("last_strings_dir") or None)
-        state.last_any_plusplus_dir = (data.get("last_any_plusplus_dir")
-                                       or data.get("last_fx_dir")      or None)
         state.export_folder    = data.get("export_folder")    or None
-        state.export_fmt_wav24   = bool(data.get("export_fmt_wav24", True))
+        if "export_fmt_flac16" in data:
+            state.export_fmt_flac16 = bool(data.get("export_fmt_flac16", True))
+            state.export_fmt_flac24 = bool(data.get("export_fmt_flac24", False))
+            state.export_fmt_wav16  = bool(data.get("export_fmt_wav16", False))
+            state.export_fmt_wav24  = bool(data.get("export_fmt_wav24", False))
+        else:
+            # Settings from before FLAC existed: FLAC 16-bit becomes the
+            # default once, rather than exporting every stem twice.
+            state.export_fmt_flac16 = True
+            state.export_fmt_wav24  = False
         state.export_fmt_mp3     = bool(data.get("export_fmt_mp3",   False))
         state.export_fmt_mp3_256 = bool(data.get("export_fmt_mp3_256", False))
         state.saved_stems_dir    = data.get("saved_stems_dir") or None
+        _AUTO_RESTART[0]         = bool(data.get("auto_restart", True))
     except Exception:
         pass
 
@@ -4242,13 +4452,15 @@ def _save_dirs():
                 "last_fv_dir":        state.last_fv_dir,
                 "last_hl_dir":        state.last_hl_dir,
                 "last_any_dir":     state.last_any_dir,
-                "last_any_plus_dir":   state.last_any_plus_dir,
-                "last_any_plusplus_dir":        state.last_any_plusplus_dir,
                 "export_folder":      state.export_folder,
+                "export_fmt_flac16":  state.export_fmt_flac16,
+                "export_fmt_flac24":  state.export_fmt_flac24,
+                "export_fmt_wav16":   state.export_fmt_wav16,
                 "export_fmt_wav24":   state.export_fmt_wav24,
                 "export_fmt_mp3":     state.export_fmt_mp3,
                 "export_fmt_mp3_256": state.export_fmt_mp3_256,
                 "saved_stems_dir":    state.saved_stems_dir,
+                "auto_restart":       bool(_AUTO_RESTART[0]),
             }, f, indent=2)
     except Exception as e:
         print("Could not save directory config:", e)
@@ -4506,184 +4718,6 @@ def apply_vff(chunk):
                         float(state.vff_lead_cut), float(state.vff_body_cut),
                         float(state.vff_presence), float(state.vff_bkg_vol), "voc")
 
-# legacy cache dicts kept as empty stubs so any external code that imports
-# them doesn't crash (they are no longer written or read)
-_vff_cache = {"key": None, "gains": None}
-
-
-# ----------------------------
-# REVERB ENGINE — Schroeder design, shared send/return bus
-#
-# Architecture:
-#   • One shared reverb instance (_shared_reverb) processes a single stereo
-#     "send bus".  All stems write their signal × reverb_amount into the bus;
-#     the reverb runs once; the wet output is added back to the mix.
-#   • This means reverb cost is O(1) regardless of how many cells have reverb.
-#
-# Implementation:
-#   • Pure NumPy circular ring buffers — no Python sample loops, no huge
-#     IIR polynomial coefficients.  Cost is O(chunk_size), not
-#     O(delay_length × chunk_size) like lfilter with long taps.
-# ----------------------------
-_COMB_DELAYS   = [1557, 1617, 1491, 1422]   # samples at 44100 Hz
-_COMB_FEEDBACK = 0.72   # reduced from 0.84 — prevents feedback divergence
-                        # when send bus carries summed multi-stem signal
-_AP_DELAYS     = [556, 441]
-_AP_GAIN       = 0.5
-
-
-class _RingBuf:
-    """Stereo circular delay buffer — NumPy only, no Python loops."""
-    __slots__ = ("buf", "pos", "size")
-
-    def __init__(self, size: int):
-        self.size = size
-        self.buf  = np.zeros((size, 2), dtype=np.float32)
-        self.pos  = 0
-
-    def flush(self):
-        """Zero the buffer — called when NaN/Inf is detected."""
-        self.buf[:] = 0.0
-        self.pos    = 0
-
-    def process_comb(self, sig: np.ndarray, fb: float) -> np.ndarray:
-        """Comb filter: y[n] = x[n-D] + fb·y[n-D].
-        Handles chunks of any size by iterating in ring-aligned slices.
-        """
-        n   = len(sig)
-        out = np.empty_like(sig)
-        pos = self.pos
-        sz  = self.size
-        buf = self.buf
-        i   = 0
-        while i < n:
-            space = sz - pos
-            take  = min(space, n - i)
-            delayed           = buf[pos:pos+take].copy()
-            new_buf           = sig[i:i+take] + delayed * fb
-            # Clamp feedback state so a hot signal can never diverge
-            np.clip(new_buf, -4.0, 4.0, out=new_buf)
-            out[i:i+take]     = delayed
-            buf[pos:pos+take] = new_buf
-            pos = (pos + take) % sz
-            i  += take
-        self.pos = pos
-        return out
-
-    def process_allpass(self, sig: np.ndarray, gain: float) -> np.ndarray:
-        """Allpass filter. Handles chunks of any size."""
-        n   = len(sig)
-        out = np.empty_like(sig)
-        pos = self.pos
-        sz  = self.size
-        buf = self.buf
-        i   = 0
-        while i < n:
-            space    = sz - pos
-            take     = min(space, n - i)
-            delayed              = buf[pos:pos+take].copy()
-            new_val              = sig[i:i+take] + gain * delayed
-            np.clip(new_val, -4.0, 4.0, out=new_val)
-            buf[pos:pos+take]    = new_val
-            out[i:i+take]        = delayed - gain * new_val
-            pos = (pos + take) % sz
-            i  += take
-        self.pos = pos
-        return out
-
-
-class _SharedReverb:
-    """Single Schroeder reverb instance that processes the shared send bus."""
-
-    def __init__(self):
-        self._sr    : int   = 0
-        self._combs : list  = []
-        self._aps   : list  = []
-
-    def _reset(self, sr_val: int):
-        scale = sr_val / 44100.0
-        self._combs = [_RingBuf(max(1, int(d * scale))) for d in _COMB_DELAYS]
-        self._aps   = [_RingBuf(max(1, int(d * scale))) for d in _AP_DELAYS]
-        self._sr    = sr_val
-
-    def _flush_all(self):
-        """Flush all delay lines — recovers from any overflow state."""
-        for b in self._combs + self._aps:
-            b.flush()
-
-    def process(self, send: np.ndarray, sr_now: int) -> np.ndarray:
-        """Process stereo send bus → stereo wet output."""
-        if sr_now != self._sr:
-            self._reset(sr_now)
-        if len(send) == 0:
-            return send
-
-        # Clamp the send bus to ±1.0 before it enters the feedback network
-        send = np.clip(send, -1.0, 1.0)
-
-        # 4 parallel comb filters summed
-        comb_out = np.zeros_like(send)
-        for cb in self._combs:
-            comb_out += cb.process_comb(send, _COMB_FEEDBACK)
-        comb_out *= 0.25
-
-        # 2 series allpass filters
-        ap_out = comb_out
-        for ap in self._aps:
-            ap_out = ap.process_allpass(ap_out, _AP_GAIN)
-
-        # Safety: if NaN or Inf slipped through, flush all state and return silence
-        if not np.isfinite(ap_out).all():
-            self._flush_all()
-            return np.zeros_like(send)
-
-        return ap_out
-
-
-_shared_reverb  = _SharedReverb()   # processes the per-stem send bus
-_master_reverb  = _SharedReverb()   # processes the final master mix — SEPARATE instance
-
-
-def _prewarm_reverb_bus(sr_val: int):
-    """Pre-initialise both reverb buses so first slider move is instant."""
-    _shared_reverb._reset(sr_val)
-    _master_reverb._reset(sr_val)
-
-
-# ----------------------------
-
-
-
-# ----------------------------
-# AIR PROCESSOR — high-shelf EQ above 8 kHz
-# amount: -1.0 (full cut) … 0.0 (flat) … +1.0 (full boost, +12 dB)
-_air_cache = {}   # keyed on (sr_now, n) — BOTH state.sr AND chunk size
-
-def apply_air(chunk, amount, sr_now):
-    """Apply a high-shelf air boost or cut above 8 kHz."""
-    if abs(amount) < 0.001 or len(chunk) == 0:
-        return chunk
-    n         = len(chunk)
-    cache_key = (sr_now, n)   # include n so different chunk sizes never corrupt the cache
-    if cache_key not in _air_cache:
-        freqs = np.fft.rfftfreq(n, d=1.0 / sr_now).astype(np.float32)
-        shelf = np.where(
-            freqs >= 10000.0, 1.0,
-            np.where(freqs >= 6000.0,
-                     (freqs - 6000.0) / 4000.0,
-                     0.0)
-        ).astype(np.float32)
-        _air_cache[cache_key] = shelf
-    shelf = _air_cache[cache_key]
-    # Gain: +12 dB at +1.0, -18 dB at -1.0
-    if amount > 0:
-        gain = 1.0 + amount * (10 ** (12.0 / 20.0) - 1.0)
-    else:
-        gain = 1.0 + amount * (1.0 - 10 ** (-18.0 / 20.0))
-    gains = (1.0 + (gain - 1.0) * shelf).astype(np.float32)
-    fft   = np.fft.rfft(chunk, axis=0)
-    fft  *= gains[:, None]
-    return np.fft.irfft(fft, n=n, axis=0).astype(np.float32)
 
 
 def apply_stem_width(chunk, width):
@@ -4844,17 +4878,14 @@ def apply_dynamics(chunk: np.ndarray,
 
 
 # Cells whose audio comes from a file rather than from separation.
-_IMPORT_KEYS = ("any", "any+", "any++",
-                "atmos_fl", "atmos_fr", "atmos_c",
-                "atmos_lfe", "atmos_bl", "atmos_br",
+_IMPORT_KEYS = ("any", "atmos_front", "atmos_center", "atmos_rear",
                 "front_vocals", "bg_vocals", "hidden_layer")
 
 # key -> the state attribute holding that cell's audio.
 _IMPORT_DATA_ATTR = {
-    "any": "any_data", "any+": "any_plus_data", "any++": "any_plusplus_data",
-    "atmos_fl": "atmos_fl_data", "atmos_fr": "atmos_fr_data",
-    "atmos_c": "atmos_c_data", "atmos_lfe": "atmos_lfe_data",
-    "atmos_bl": "atmos_bl_data", "atmos_br": "atmos_br_data",
+    "any": "any_data",
+    "atmos_front": "atmos_front_data", "atmos_center": "atmos_center_data",
+    "atmos_rear": "atmos_rear_data",
     "front_vocals": "fv_data", "bg_vocals": "bg_vocals_data",
     "hidden_layer": "hl_data",
 }
@@ -4879,14 +4910,6 @@ def _refresh_transport_state():
 _MULTICH_EXTS = (".eac3", ".ec3", ".ac3", ".mp4", ".m4a", ".mkv", ".mov",
                  ".m4v", ".webm", ".ts", ".wav", ".flac", ".w64", ".caf")
 
-# The order FFmpeg hands back for 5.1, and the cell each channel belongs in.
-_51_TO_CELL = ("atmos_fl", "atmos_fr", "atmos_c",
-               "atmos_lfe", "atmos_bl", "atmos_br")
-# Where each cell sits, so an imported bed is positioned without touching the
-# faders by hand.
-_51_PAN = {"atmos_fl": -1.0, "atmos_bl": -1.0,
-           "atmos_fr":  1.0, "atmos_br":  1.0,
-           "atmos_c":   0.0, "atmos_lfe": 0.0}
 
 
 def _ffmpeg_path():
@@ -4948,65 +4971,487 @@ def _decode_multichannel(path):
     return audio, int(file_sr)
 
 
-def import_atmos_bed():
-    """Load one multichannel file and spread its channels over the cells."""
-    if state.separating:
-        return
-    path = filedialog.askopenfilename(
-        title="Import ATMOS bed — E-AC-3 / multichannel file",
-        initialdir=getattr(state, "last_atmos_fl_dir", None),
-        filetypes=[("Dolby / multichannel audio",
-                    "*.eac3 *.ec3 *.ac3 *.mp4 *.m4a *.mkv *.mov *.m4v "
-                    "*.webm *.ts *.wav *.flac *.w64 *.caf"),
-                   ("All files", "*.*")])
-    if not path:
-        return
-    state.last_atmos_fl_dir = os.path.dirname(path)
+# ============================================================
+# ATMOS BED
+# A bed is loaded like any song (LOAD, LOADLIST or a drop). It is split into
+# three tracks — FRONT (FL + FR + LFE), CENTER, REAR (BL + BR) — and every
+# track goes through the same chain as a song: first the six-stem model for
+# all three tracks, then the HQ models (unwa instrumental, re-stem, HQ
+# vocals, karaoke, strings) track by track.
+#
+# The stem row plays the sum of the three tracks, so soloing DRUMS gives the
+# drums of all three; the ATMOS cells pick which tracks are heard — solo
+# FRONT for the front drums only. Whatever was playing keeps playing until
+# the new bed's six-stem pass is done, then it is replaced in one go.
+# ============================================================
+_atmos_stems = {}                 # track key -> {cell key: (N, 2) array}
+_atmos_quality = {}               # track key -> "LQ" | "HQ"
+_atmos_cancel = [threading.Event()]
+_atmos_bed_path = [None]
+# The cells (besides the six stems) whose audio is kept per track.
+_ATMOS_EXTRA_ATTR = {"instrumental": "instrumental", "front_vocals": "fv_data",
+                     "bg_vocals": "bg_vocals_data", "strings": "strings_data"}
 
+
+def _cancel_bed_job():
+    _atmos_cancel[0].set()
+
+
+def _clear_bed():
+    """Remove the bed entirely: its tracks, its stems, its status lines."""
+    _atmos_stems.clear()
+    _atmos_quality.clear()
+    state.atmos_separated = False
+    with audio_lock:
+        for k in _ATMOS_KEYS:
+            setattr(state, f"{k}_data", None)
+    if running:
+        for k in _ATMOS_KEYS:
+            app.after(0, lambda k=k: (_atmos_cell_status(k, ""), _atmos_cell_progress_clear(k)))
+
+
+# ── Per-cell status and progress ───────────────────────────────────────────
+_atmos_cell_ui = {}               # track key -> (status label, row, bar, %)
+
+
+def _atmos_cell_status(key, text, colour="#ffaa00"):
+    ui = _atmos_cell_ui.get(key)
+    if ui:
+        try:
+            ui[0].configure(text=text, text_color=colour)
+        except Exception:
+            pass
+
+
+def _atmos_cell_progress(key, frac):
+    ui = _atmos_cell_ui.get(key)
+    if not ui:
+        return
+    _lbl, row, bar, pct = ui
+    try:
+        if not row.winfo_ismapped():
+            row.pack(fill="x", padx=6, pady=(1, 0), after=_lbl)
+        frac = max(0.0, min(1.0, frac))
+        bar.set(frac)
+        pct.configure(text=f"{int(round(frac * 100))}%")
+    except Exception:
+        pass
+
+
+def _atmos_cell_progress_clear(key):
+    ui = _atmos_cell_ui.get(key)
+    if ui:
+        try:
+            ui[2].set(0)
+            ui[3].configure(text="0%")
+            ui[1].pack_forget()
+        except Exception:
+            pass
+
+
+def _atmos_quality_status(key):
+    q = _atmos_quality.get(key)
+    if q == "HQ":
+        _atmos_cell_status(key, "HQ ✓", "#44cc44")
+    elif q == "LQ":
+        _atmos_cell_status(key, "LQ (6-STEM)", "#ffaa00")
+
+
+def _atmos_reporter(key, stage, base=0.0, span=1.0):
+    """A progress callback that shows one stage on one ATMOS cell."""
+    label = _ATMOS_LABELS[key]
+
+    def _report(v):
+        if running:
+            whole = base + span * max(0.0, min(1.0, v))
+            app.after(0, lambda: (_atmos_cell_status(key, f"{stage}…", "#ffaa00"),
+                                  _atmos_cell_progress(key, whole)))
+    _report.label = label
+    return _report
+
+
+# ── Mixing ─────────────────────────────────────────────────────────────────
+def _atmos_track_gain(key):
+    """How loud one bed track is: its fader, mute and solo.
+
+    The ATMOS cells form their own solo group here — soloing FRONT picks
+    the front track without silencing the stem row.
+    """
+    soloed = [k for k in _ATMOS_KEYS if state.stem_solo.get(k, False)]
+    if soloed:
+        if key not in soloed:
+            return 0.0
+    elif state.stem_mute.get(key, False):
+        return 0.0
+    return float(getattr(state, f"{key}_volume", 1.0))
+
+
+def _atmos_mix_slice(name, start, frames, nudge_s, meter_gain=0.0, meters=None):
+    """One cell's audio for this block: the selected tracks, summed.
+
+    With meters given, each track's share of what is actually heard is added
+    to its ATMOS cell's meter, so those meters follow both the track
+    selection and the stem row.
+    """
+    acc = None
+    for key in _ATMOS_KEYS:
+        stems = _atmos_stems.get(key)
+        if not stems or name not in stems:
+            continue
+        w = _atmos_track_gain(key)
+        if w <= 0.0:
+            continue
+        seg = _nudged_slice(stems[name], start, frames, nudge_s) * w
+        acc = seg if acc is None else acc + seg
+        if meters is not None and meter_gain > 0.0:
+            m = meters.get(key)
+            meters[key] = seg * meter_gain if m is None else m + seg * meter_gain
+    if acc is None:
+        return np.zeros((frames, 2), dtype=np.float32)
+    return acc
+
+
+def _fit_len(a, n):
+    a = np.asarray(a, dtype=np.float32)
+    if len(a) < n:
+        return np.pad(a, ((0, n - len(a)), (0, 0)))
+    return a[:n]
+
+
+def _atmos_resum():
+    """Put the sum of every track into the cells (for display and export).
+
+    Playback reads the tracks themselves, so the ATMOS cells can pick; these
+    sums are what the rest of RAMMA sees — waveform, export, cell states.
+    """
+    if not _atmos_stems:
+        return
+    n = max(len(v) for st in _atmos_stems.values() for v in st.values()
+            if hasattr(v, "shape") and getattr(v, "ndim", 0) == 2)
+    with audio_lock:
+        if state.stems:
+            for k in _STEM_KEYS:
+                parts = [_fit_len(st[k], n) for st in _atmos_stems.values() if k in st]
+                if parts and k in state.stems and len(state.stems[k]) == n:
+                    state.stems[k][:] = np.sum(parts, axis=0)
+        for k, attr in _ATMOS_EXTRA_ATTR.items():
+            parts = [_fit_len(st[k], n) for st in _atmos_stems.values() if k in st]
+            setattr(state, attr, np.sum(parts, axis=0).astype(np.float32) if parts else None)
+        if state.instrumental is not None:
+            state.instrumental_is_quick = False
+
+
+# ── Separation ─────────────────────────────────────────────────────────────
+def _tmp_wav(tag, audio):
+    import tempfile
+    path = os.path.join(tempfile.gettempdir(),
+                        f"ramma_{tag}_{os.getpid()}_{int(time.time() * 1000)}.wav")
+    sf.write(path, np.asarray(audio, dtype=np.float32), 44100, subtype="FLOAT")
+    return path
+
+
+def _exclusive(tag, m, fn, *a, **kw):
+    """Run a result-only pass with the GPU to itself and its model on it."""
+    _pass_acquire(tag)
+    try:
+        _model_on_gpu(m)
+        return fn(*a, **kw)
+    finally:
+        _model_off_gpu(m)
+        _pass_release()
+
+
+def _bed_six_stem(key, audio, cancel):
+    tmp = _tmp_wav(f"bed_{key}", audio)
+    res = {}
+    try:
+        _exclusive(f"ATMOS {_ATMOS_LABELS[key]}", model, separate, tmp, into=res,
+                   cancel=cancel, progress=_atmos_reporter(key, "6-STEM"))
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+    return res.get("stems")
+
+
+def _bed_hq_chain(key, cancel):
+    """The HQ models on one track: instrumental, re-stem, vocals, karaoke,
+    strings — whichever are switched on and installed."""
+    st = _atmos_stems.get(key)
+    raw = getattr(state, f"{key}_data", None)
+    if st is None or raw is None:
+        return False
+    n = len(raw)
+    tmp_track = _tmp_wav(f"bedhq_{key}", raw)
+    stages = [s for s, ok in (
+        ("INST", _INST_AUTO and inst_model is not None),
+        ("RE-STEM", _RESTEM_FROM_INST and _INST_AUTO and inst_model is not None and model is not None),
+        ("VOCALS", _VOC_AUTO and vocals_model is not None),
+        ("KARAOKE", _KARA_AUTO and kara_model is not None),
+        ("STRINGS", _STR_AUTO and strings_model is not None)) if ok]
+    if not stages:
+        # No HQ model switched on or installed: the track stays as the six-
+        # stem pass left it, and its badge says so.
+        try:
+            os.remove(tmp_track)
+        except Exception:
+            pass
+        return False
+    span = 1.0 / max(1, len(stages))
+    step = [0]
+
+    def rep(stage):
+        r = _atmos_reporter(key, f"HQ: {stage}", step[0] * span, span)
+        step[0] += 1
+        return r
+    try:
+        if "INST" in stages and not cancel.is_set():
+            res = {}
+            _exclusive(f"ATMOS {_ATMOS_LABELS[key]} instrumental", inst_model,
+                       separate_inst, tmp_track, into=res, cancel=cancel,
+                       progress=rep("INST"))
+            if res.get("instrumental") is not None:
+                st["instrumental"] = _fit_len(res["instrumental"], n)
+        if "RE-STEM" in stages and not cancel.is_set() and "instrumental" in st:
+            tmp_inst = _tmp_wav(f"bedinst_{key}", st["instrumental"])
+            try:
+                res = {}
+                _exclusive(f"ATMOS {_ATMOS_LABELS[key]} re-stem", model, separate,
+                           tmp_inst, into=res, cancel=cancel, progress=rep("RE-STEM"))
+            finally:
+                try:
+                    os.remove(tmp_inst)
+                except Exception:
+                    pass
+            for k in _RESTEM_KEYS:
+                if res.get("stems") and k in res["stems"]:
+                    st[k] = _fit_len(res["stems"][k], n)
+        st["_other_full"] = st["other"].copy()
+        _atmos_resum()
+        if "VOCALS" in stages and not cancel.is_set():
+            res = {}
+            refine_vocals(tmp_track, cancel=cancel, into=res, progress=rep("VOCALS"))
+            if res.get("vocals") is not None:
+                st["vocals"] = _fit_len(res["vocals"], n)
+                _atmos_resum()
+        if "KARAOKE" in stages and not cancel.is_set():
+            res = {"_vocals_src": st["vocals"]}
+            _exclusive(f"ATMOS {_ATMOS_LABELS[key]} karaoke", kara_model,
+                       separate_bg_vocals, into=res, cancel=cancel,
+                       progress=rep("KARAOKE"))
+            for k in ("front_vocals", "bg_vocals"):
+                if res.get(k) is not None:
+                    st[k] = _fit_len(res[k], n)
+            _atmos_resum()
+        if "STRINGS" in stages and not cancel.is_set():
+            res = {}
+            separate_strings(cancel=cancel, src=st["_other_full"], into=res,
+                             progress=rep("STRINGS"))
+            if res.get("strings") is not None:
+                strings = _fit_len(res["strings"], n)
+                st["strings"] = strings
+                st["other"] = st["_other_full"] - strings   # complementary
+                _atmos_resum()
+    finally:
+        try:
+            os.remove(tmp_track)
+        except Exception:
+            pass
+    if cancel.is_set():
+        return False
+    _atmos_quality[key] = "HQ"
+    if running:
+        app.after(0, lambda: (_atmos_cell_progress_clear(key), _atmos_quality_status(key)))
+    return True
+
+
+def _install_bed(path, tracks, results):
+    """The new bed takes over: whatever was playing is replaced in one go."""
+    _cancel_current_load()
+    _unload_track_extras(cancel_bed=False)
+    _apply_new_song_reset()              # clears the old song or bed
+    with audio_lock:
+        state.instrumental = None
+        state.instrumental_is_quick = False
+        state.any_data = None
+        state.separating = False
+        _eq_zi_state.clear()
+        for key in _ATMOS_KEYS:
+            setattr(state, f"{key}_data", tracks.get(key))
+            setattr(state, f"{key}_sr", state.sr)
+            state.stem_pan[key] = 0.0
+    _set_current_track(path)
+    state.loaded_audio_name = state.current_audio_name
+    _atmos_bed_path[0] = path
+    if results:
+        n = max(len(st[k]) for st in results.values() for k in st)
+        for st in results.values():
+            for k in list(st):
+                st[k] = _fit_len(st[k], n)
+        summed = {k: np.sum([results[t][k] for t in results if k in results[t]],
+                            axis=0).astype(np.float32)
+                  for k in _STEM_KEYS}
+        _atmos_stems.clear()
+        _atmos_stems.update(results)
+        for key in results:
+            _atmos_quality[key] = "LQ"
+        _commit_saved_stems(summed)
+        state.atmos_separated = True
+    if running:
+        def _ui():
+            for key in _ATMOS_KEYS:
+                btn = globals().get(f"{key}_import_btn")
+                if btn is not None and key in tracks:
+                    try:
+                        btn.configure(text=f"⬡ {os.path.basename(path)[:14]}")
+                    except Exception:
+                        pass
+                _atmos_cell_progress_clear(key)
+                _atmos_quality_status(key)
+            try:
+                progress_bar.pack_forget()
+                _clear_progress()
+                wave_canvas.pack(fill="both", expand=True)
+                _unlock_transport()
+                if state.stems:
+                    _draw_static_waveform()
+                else:
+                    _refresh_import_waveform()
+                _refresh_transport_state()
+                _paint_all_ms()
+                _playlist_refresh()
+            except Exception as e:
+                print("[ATMOS] Screen update:", e)
+        app.after(0, _ui)
+
+
+def _bed_job(path, tracks, cancel):
+    """Separate a new bed, then let it take over, then make it HQ."""
+    _lower_thread_priority()
+    if model is None:
+        _install_bed(path, tracks, None)       # no model: the raw bed plays
+        return
+    results = {}
+    for key in _ATMOS_KEYS:
+        if key not in tracks:
+            continue
+        print(f"[ATMOS] Six-stem pass on {_ATMOS_LABELS[key]}…")
+        stems = _bed_six_stem(key, tracks[key], cancel)
+        if cancel.is_set():
+            print("[ATMOS] Cancelled")
+            return
+        if not stems:
+            print(f"[ATMOS] {_ATMOS_LABELS[key]} failed — keeping the previous song")
+            if running:
+                app.after(0, lambda k=key: _atmos_cell_status(k, "FAILED", BRIGHT_RED))
+            return
+        results[key] = stems
+        if running:
+            app.after(0, lambda k=key: (_atmos_cell_progress_clear(k),
+                                        _atmos_cell_status(k, "6-STEM DONE", "#ffaa00")))
+    print("[ATMOS] Six-stem passes done — the bed takes over")
+    _install_bed(path, tracks, results)
+    for key in _ATMOS_KEYS:
+        if key in results and not cancel.is_set():
+            print(f"[ATMOS] HQ models on {_ATMOS_LABELS[key]}…")
+            _bed_hq_chain(key, cancel)
+    if cancel.is_set():
+        return
+    # Every track done: the VCAs work as they do for a song.
+    if running:
+        if state.fv_data is not None or state.bg_vocals_data is not None:
+            app.after(0, _split_replaces_vocals)
+        if state.instrumental is not None and any(
+                "instrumental" in st for st in _atmos_stems.values()):
+            app.after(0, _inst_becomes_vca)
+        app.after(0, _update_inst_status_label)
+    print("[ATMOS] All tracks HQ")
+
+
+def _bed_tracks_from(audio, nch, file_sr):
+    """FRONT (FL + FR + LFE at -3 dB), CENTER, REAR (BL + BR), resampled."""
+    ch = lambda i: audio[:, i].astype(np.float32) if i < nch else None
+    FL, FR, C, LFE, BL, BR = (ch(i) for i in range(6))
+    tracks = {}
+    if nch == 1:
+        tracks["atmos_front"] = np.stack([FL, FL], axis=1)
+    elif nch >= 2:
+        lfe = (LFE * 0.7071) if LFE is not None else 0.0
+        tracks["atmos_front"] = np.stack([FL + lfe, FR + lfe], axis=1)
+    if C is not None:
+        tracks["atmos_center"] = np.stack([C, C], axis=1)
+    if BL is not None and BR is not None:
+        tracks["atmos_rear"] = np.stack([BL, BR], axis=1)
+    return {k: _resample_audio(np.ascontiguousarray(v), file_sr) for k, v in tracks.items()}
+
+
+def import_atmos_bed(path):
+    """Load an Atmos bed the way a song is loaded."""
+    state.last_atmos_front_dir = os.path.dirname(path)
     try:
         audio, file_sr = _decode_multichannel(path)
     except Exception as e:
         print("[ATMOS] Import failed:", e)
         return
-
     nch = audio.shape[1]
     print(f"[ATMOS] {os.path.basename(path)}: {nch} channels at {file_sr} Hz")
     if _probe_joc(path):
         print("[ATMOS] This looks like a Dolby Atmos (JOC) stream. FFmpeg "
               "decodes the 5.1 bed only — the height objects stay folded "
               "into it, since rendering them needs a licensed Dolby decoder.")
-    if nch < 6:
-        print(f"[ATMOS] Only {nch} channels: filling the first cells and "
-              f"leaving the rest empty.")
-    elif nch > 6:
+    if nch > 6:
         print(f"[ATMOS] {nch} channels: using the first six (the 5.1 bed).")
+    tracks = _bed_tracks_from(audio, nch, file_sr)
+    names = {"atmos_front": "FRONT (FL+FR+LFE)", "atmos_center": "CENTER",
+             "atmos_rear": "REAR (BL+BR)"}
+    print(f"[ATMOS] {len(tracks)} track(s): {', '.join(names[k] for k in tracks)}")
 
-    filled = 0
-    for idx, key in enumerate(_51_TO_CELL):
-        if idx >= nch:
-            break
-        mono = audio[:, idx]
-        stereo = np.stack([mono, mono], axis=1).astype(np.float32)
-        stereo = _resample_audio(stereo, file_sr)
-        with audio_lock:
-            setattr(state, f"{key}_data", stereo)
-            setattr(state, f"{key}_sr", state.sr)
-        state.stem_pan[key] = _51_PAN.get(key, 0.0)
-        btn = globals().get(f"{key}_import_btn")
-        if btn is not None:
-            try:
-                btn.configure(text=f"⬡ {os.path.basename(path)[:14]}")
-            except Exception:
-                pass
-        filled += 1
+    # Anything still separating gives way; what is playing keeps playing.
+    _cancel_bed_job()
+    _cancel_current_load()
+    _pending_new_song_reset[0] = True
+    ev = threading.Event()
+    _atmos_cancel[0] = ev
+    if running:
+        _atmos_set_open(True)
+        for key in _ATMOS_KEYS:
+            if key in tracks:
+                _atmos_cell_status(key, "WAITING", TEXT_DIM)
+    threading.Thread(target=_bed_job, args=(path, tracks, ev), daemon=True).start()
 
-    print(f"[ATMOS] {filled} channels loaded into the ATMOS cells")
-    _refresh_import_waveform()
-    _refresh_transport_state()
+
+def start_atmos_separation():
+    """SEPARATE BED: run the whole chain again on the loaded bed."""
+    if _atmos_bed_path[0] and os.path.isfile(_atmos_bed_path[0]):
+        import_atmos_bed(_atmos_bed_path[0])
+    else:
+        print("[ATMOS] No bed loaded")
+
+
+_ATMOS_FILE_EXTS = (".eac3", ".ec3", ".ac3")
+
+
+def _is_atmos_file(path):
+    """True for a Dolby / multichannel file: more than two channels."""
+    low = path.lower()
+    if low.endswith(_ATMOS_FILE_EXTS):
+        return True
     try:
-        _paint_all_ms()
+        return sf.info(path).channels > 2
     except Exception:
         pass
+    exe = shutil.which("ffprobe")
+    if not exe:
+        return False
+    try:
+        import subprocess
+        r = subprocess.run([exe, "-v", "error", "-select_streams", "a:0",
+                            "-show_entries", "stream=channels", "-of", "csv=p=0",
+                            path], capture_output=True, text=True, timeout=15)
+        return int((r.stdout or "0").strip().splitlines()[0]) > 2
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -5277,7 +5722,6 @@ def mix(start, frames):
     stems_now = state.stems if state.stems else {}
 
     out      = np.zeros((frames, 2), dtype=np.float32)
-    rev_send = np.zeros((frames, 2), dtype=np.float32)
     _vols    = state.stem_volumes
     sr_int   = int(state.sr) if state.sr else 44100
 
@@ -5290,16 +5734,28 @@ def mix(start, frames):
     # the two halves.
     _vca = bool(getattr(state, "vocals_is_vca", False))
     _vca_vol = float(state.stem_volumes.get("vocals", 1.0)) if _vca else 1.0
+    _inst_vca = bool(getattr(state, "inst_is_vca", False))
+    _inst_vca_vol = float(state.instrumental_vol) if _inst_vca else 1.0
+    _atmos_sep = bool(getattr(state, "atmos_separated", False)) and bool(_atmos_stems)
+    _atmos_meters = {}                # bed track -> its share of this block
 
     any_solo = any(state.stem_solo.get(k, False)
                    for k in list(stems_now.keys()) +
                             ["front_vocals", "bg_vocals", "hidden_layer",
-                             "any", "any+", "any++", "strings",
-                             "atmos_fl", "atmos_fr", "atmos_c",
-                             "atmos_lfe", "atmos_bl", "atmos_br",
-                             "instrumental"])
+                             "any", "strings",
+                             "instrumental"] +
+                            # The ATMOS cells are a solo group of their own
+                            # once the bed is separated: soloing FRONT picks
+                            # a track, it does not silence the stem row.
+                            ([] if _atmos_sep else list(_ATMOS_KEYS)))
 
     def _audible(key):
+        if _inst_vca:
+            if key == "instrumental":
+                return False              # silent: it is only a control now
+            if key in _INST_CHILDREN and any_solo:
+                return bool(state.stem_solo.get(key, False)
+                            or state.stem_solo.get("instrumental", False))
         if _vca:
             if key == "vocals":
                 return False              # silent: it is only a control now
@@ -5346,7 +5802,15 @@ def mix(start, frames):
         if not _audible(name) and name not in _debleed_srcs:
             continue
         nudge_s = int(state.stem_nudge.get(name, 0))
-        c = _nudged_slice(data, start, frames, nudge_s)
+        if _atmos_sep:
+            c = _atmos_mix_slice(                                 # chosen bed tracks
+                name, start, frames, nudge_s,
+                meter_gain=(_vols.get(name, 1.0) * (_inst_vca_vol if
+                            (_inst_vca and name in _INST_CHILDREN) else 1.0)
+                            if _audible(name) else 0.0),
+                meters=_atmos_meters)
+        else:
+            c = _nudged_slice(data, start, frames, nudge_s)
         _raw_eq_chunks[name] = apply_eq(c, state.sr, state.eq_bands.get(name, [0]*5), stem_key=name)
 
     for name, data in stems_now.items():
@@ -5354,13 +5818,13 @@ def mix(start, frames):
             state._meter_levels[name] = (0.0, 0.0)
             continue
         vol   = _vols.get(name, 1.0)
+        if _inst_vca and name in _INST_CHILDREN:
+            vol *= _inst_vca_vol          # the INST fader rides its stems
         if vol <= 0.0:
             # Silent either way: no point running the chain for it.
             state._meter_levels[name] = (0.0, 0.0)
             continue
         chunk = _raw_eq_chunks[name].copy()
-        if state.stem_invert.get(name, False):
-            chunk = -chunk
         if name == "vocals" and state.vff_enabled:
             chunk = apply_vff(chunk)
         chunk = apply_debleed(chunk, name, _raw_eq_chunks, sr_int)
@@ -5371,15 +5835,11 @@ def mix(start, frames):
         chunk = _apply_dyn(chunk, name)
         chunk = apply_stem_width(chunk, state.stem_widths.get(name, 1.0))
         chunk = apply_pan(chunk, state.stem_pan.get(name, 0.0))
-        chunk = apply_air(chunk, state.stem_air.get(name, 0.0), sr_int)
         chunk = apply_limiter(chunk, name,
                               state.stem_lim_enabled.get(name, False),
                               state.stem_lim_threshold.get(name, _LIM_DEFAULTS["threshold"]),
                               state.stem_lim_ceiling.get(name,   _LIM_DEFAULTS["ceiling"]),
                               sr_int)
-        rev_amt = state.stem_reverbs.get(name, 0.0)
-        if rev_amt > 0.001:
-            rev_send += chunk * rev_amt
         scaled = chunk * vol
         # Per-channel peaks, so the meter can show left and right separately.
         state._meter_levels[name] = (float(np.max(np.abs(scaled[:, 0]))),
@@ -5387,26 +5847,29 @@ def mix(start, frames):
         out += scaled
 
     def _mix_import(data, vol, key, vff_fn=None):
-        """Process one user-imported stem and accumulate into out/rev_send.
+        """Process one user-imported stem and accumulate it into out.
 
         Pipeline: slice → EQ → VFF (optional) → leveller → dynamics →
-                  width → pan → air → reverb send → scale → accumulate.
+                  width → pan → limiter → scale → accumulate.
         Identical logic to the Demucs-stem loop; extracted so fv/bgv/hl/
         synth/strings/fx all share one implementation instead of six copies.
         """
         if data is None or vol <= 0 or not _audible(key):
             state._meter_levels[key] = (0.0, 0.0)
             return
-        buf_len = len(data)
-        if buf_len == 0:
-            return
-        s  = start % buf_len
-        e  = s + frames
-        ch = data[s:e].copy() if e <= buf_len else np.concatenate([data[s:], data[:e - buf_len]])
-        if len(ch) < frames:
-            ch = np.pad(ch, ((0, frames - len(ch)), (0, 0)))
-        if state.stem_invert.get(key, False):
-            ch = -ch
+        if _atmos_sep and key in _ATMOS_EXTRA_ATTR:
+            # A separated bed: this cell's audio is the chosen tracks' share.
+            ch = _atmos_mix_slice(key, start, frames, 0,
+                                  meter_gain=vol, meters=_atmos_meters)
+        else:
+            buf_len = len(data)
+            if buf_len == 0:
+                return
+            s  = start % buf_len
+            e  = s + frames
+            ch = data[s:e].copy() if e <= buf_len else np.concatenate([data[s:], data[:e - buf_len]])
+            if len(ch) < frames:
+                ch = np.pad(ch, ((0, frames - len(ch)), (0, 0)))
         ch = apply_eq(ch, state.sr, state.eq_bands.get(key, [0] * 5), stem_key=key)
         if vff_fn is not None:
             ch = vff_fn(ch)
@@ -5417,15 +5880,11 @@ def mix(start, frames):
         ch = _apply_dyn(ch, key)
         ch = apply_stem_width(ch, state.stem_widths.get(key, 1.0))
         ch = apply_pan(ch, state.stem_pan.get(key, 0.0))
-        ch = apply_air(ch, state.stem_air.get(key, 0.0), sr_int)
         ch = apply_limiter(ch, key,
                            state.stem_lim_enabled.get(key, False),
                            state.stem_lim_threshold.get(key, _LIM_DEFAULTS["threshold"]),
                            state.stem_lim_ceiling.get(key,   _LIM_DEFAULTS["ceiling"]),
                            sr_int)
-        rev_amt = state.stem_reverbs.get(key, 0.0)
-        if rev_amt > 0.001:
-            rev_send.__iadd__(ch * rev_amt)
         scaled = ch * vol
         state._meter_levels[key] = (float(np.max(np.abs(scaled[:, 0]))),
                                     float(np.max(np.abs(scaled[:, 1]))))
@@ -5438,17 +5897,14 @@ def mix(start, frames):
                 vff_fn=apply_bgv_vff if state.bgv_vff_enabled else None)
     _mix_import(state.hl_data,         state.hl_volume,         "hidden_layer",
                 vff_fn=apply_hl_vff  if state.hl_vff_enabled  else None)
-    # The ATMOS bed channels
-    _mix_import(state.atmos_fl_data, state.atmos_fl_volume, "atmos_fl")
-    _mix_import(state.atmos_fr_data, state.atmos_fr_volume, "atmos_fr")
-    _mix_import(state.atmos_c_data, state.atmos_c_volume, "atmos_c")
-    _mix_import(state.atmos_lfe_data, state.atmos_lfe_volume, "atmos_lfe")
-    _mix_import(state.atmos_bl_data, state.atmos_bl_volume, "atmos_bl")
-    _mix_import(state.atmos_br_data, state.atmos_br_volume, "atmos_br")
-    _mix_import(state.strings_data,  state.strings_volume,  "strings")
+    # The ATMOS bed tracks. Once the bed is separated their audio lives in
+    # the stem cells, and these cells only choose which tracks are heard.
+    if not _atmos_sep:
+        _mix_import(state.atmos_front_data,  state.atmos_front_volume,  "atmos_front")
+        _mix_import(state.atmos_center_data, state.atmos_center_volume, "atmos_center")
+        _mix_import(state.atmos_rear_data,   state.atmos_rear_volume,   "atmos_rear")
+    _mix_import(state.strings_data,  state.strings_volume * _inst_vca_vol,  "strings")
     _mix_import(state.any_data,      state.any_volume,      "any")
-    _mix_import(state.any_plus_data,    state.any_plus_volume,    "any+")
-    _mix_import(state.any_plusplus_data,         state.any_plusplus_volume,         "any++")
     # Only mix the instrumental when it matches the loaded stems; a leftover
     # array from the previous song would play over the new one.
     _inst_data = state.instrumental
@@ -5458,16 +5914,16 @@ def mix(start, frames):
             _inst_data = None
     _mix_import(_inst_data, state.instrumental_vol, "instrumental")
 
+    if _atmos_sep:
+        # Each ATMOS cell's meter shows its track's share of what is heard.
+        for _ak in _ATMOS_KEYS:
+            _m = _atmos_meters.get(_ak)
+            state._meter_levels[_ak] = ((float(np.max(np.abs(_m[:, 0]))),
+                                         float(np.max(np.abs(_m[:, 1]))))
+                                        if _m is not None else (0.0, 0.0))
+
     out *= state.volume_master
 
-    if np.max(np.abs(rev_send)) > 0.001:
-        out += _shared_reverb.process(rev_send, sr_int)
-
-    if state.reverb_master > 0.001:
-        master_wet = _master_reverb.process(out, sr_int)
-        out = out * (1.0 - state.reverb_master) + master_wet * state.reverb_master
-
-    out = apply_air(out, state.air_master, sr_int)
 
     if state.stereo_width != 1.0:
         mid        = (out[:,0] + out[:,1]) * 0.5
@@ -5504,7 +5960,17 @@ def callback(outdata, frames, time, status):
         state.position = ls + (state.position - ls) % region
 
         remaining = le - state.position
-        if remaining < frames:
+        looping = (state.loop_start is not None and state.loop_end is not None
+                   and state.loop_end > state.loop_start)
+        if remaining < frames and not looping and not _AUTO_RESTART[0]:
+            # AUTO-RESTART off: play to the end, then stop at the start.
+            part1 = mix(state.position, remaining)
+            outdata[:] = np.concatenate(
+                [part1, np.zeros((frames - remaining, 2), dtype=part1.dtype)])
+            state.position = 0
+            if running:
+                app.after(0, stop)
+        elif remaining < frames:
             part1 = mix(state.position, remaining)
             part2 = mix(ls, frames - remaining)
             outdata[:] = np.concatenate([part1, part2])
@@ -5537,9 +6003,19 @@ def load_file():
         return
     path = filedialog.askopenfilename(
         initialdir=state.last_load_dir,
-        filetypes=[("Audio files", "*.wav *.flac *.mp3 *.ogg *.aif *.aiff *.m4a *.aac *.mp4 *.m4v *.mov"), ("All files", "*.*")]
+        filetypes=[("Audio files", "*.wav *.flac *.mp3 *.ogg *.aif *.aiff *.m4a "
+                    "*.aac *.mp4 *.m4v *.mov *.mkv *.eac3 *.ec3 *.ac3"),
+                   ("All files", "*.*")]
     )
     if not path:
+        return
+    if _is_atmos_file(path):
+        # A Dolby / multichannel file: it becomes an ATMOS bed.
+        state.last_load_dir = os.path.dirname(path)
+        if path not in _playlist_paths:
+            _playlist_paths.append(path)
+            _playlist_refresh()
+        import_atmos_bed(path)
         return
     # Track name, list marker and export tracking are set in _start_load.
     _clear_progress()
@@ -5569,9 +6045,6 @@ def load_file():
         _kara_load_first(path, cancel)
         # LOAD FIRST: the strings model runs on the track itself, so it can
         # go before the six-stem pass and fill its cell that much sooner.
-        if (_STR_AUTO and _STR_FIRST and not cancel.is_set()
-                and strings_model is not None and "strings" not in _saved_cover):
-            separate_strings(path, cancel=cancel)
         if _INST_AUTO and _INST_CONCURRENT:
             t_inst = threading.Thread(target=_run_low_priority, args=(_inst_or_saved, path),
                                       kwargs={"cancel": cancel}, daemon=True)
@@ -5639,7 +6112,7 @@ def find_saved_stems(path):
     keys = "|".join(sorted(_SAVED_STEM_KEYS, key=len, reverse=True))
     pat = re.compile(rf"^{re.escape(base)}_(?P<key>{keys})"
                      rf"(?P<dup>[ _]\(?\d+\)?)?"
-                     rf"(?P<ext>\.wav|\.flac|_256k\.mp3|\.mp3)$",
+                     rf"(?P<ext>(?:_24bit)?\.wav|(?:_24bit)?\.flac|_(?:256|192)k\.mp3|\.mp3)$",
                      re.IGNORECASE)
     found = {}
     for d in _saved_stem_dirs(path):
@@ -5653,7 +6126,7 @@ def find_saved_stems(path):
                 continue
             key = m.group("key").lower()
             full = os.path.join(d, name)
-            lossless = m.group("ext").lower() in (".wav", ".flac")
+            lossless = m.group("ext").lower().endswith((".wav", ".flac"))
             rank = (lossless, os.path.getmtime(full))
             if key not in found or rank > found[key][0]:
                 found[key] = (rank, full)
@@ -5724,7 +6197,6 @@ def import_saved_stems(path):
         if "strings" in loaded:
             with audio_lock:
                 state.strings_data, state.strings_sr = loaded["strings"], sr
-                state.strings_is_quick = False
             _saved_cover.add("strings")
     except Exception as e:
         print(f"[Stems] Could not use the saved stems ({e}) — separating "
@@ -5745,6 +6217,7 @@ def _commit_saved_stems(new_stems):
     """Put imported six-stem cells in place, as a finished separation does."""
     mono = np.mean(sum(new_stems.values()), axis=1)
     state.waveform_data = mono[::max(1, len(mono) // 2000)]
+    _apply_new_song_reset()              # saved stems: the new song takes over
     with audio_lock:
         state.stems = new_stems
         state.loaded_audio_name = state.current_audio_name
@@ -5789,6 +6262,12 @@ def _six_or_saved(path, cancel=None):
     if "stems" in _saved_cover:
         return
     separate(path, cancel=cancel)
+    # LOAD FIRST on STRINGS: the strings come from OTHER, so the earliest
+    # they can run is right here, straight after the six-stem pass.
+    if (_STR_AUTO and _STR_FIRST and strings_model is not None
+            and "strings" not in _saved_cover
+            and not (cancel is not None and cancel.is_set())):
+        separate_strings(cancel=cancel)
     # Saved strings but freshly separated stems: take the strings out of
     # OTHER so the two cells stay complementary, as the model pass would.
     if "strings" in _saved_cover and state.stems and \
@@ -5833,6 +6312,127 @@ def _kara_load_first(path, cancel):
         _kara_done_first[0] = True
 
 
+# ── Better stems from the instrumental ─────────────────────────────────────
+# unwa's model makes a far cleaner instrumental than the six-stem model can
+# pull out of the full mix. Running that instrumental back through the six-
+# stem model gives cleaner drums, bass, guitar, piano and other: there are
+# no vocals left for them to bleed from. VOCALS keeps its own source.
+_RESTEM_FROM_INST = True
+_RESTEM_KEYS = ("drums", "bass", "guitar", "piano", "other")
+_fixes_deferred = [False]
+
+
+def _restem_will_run():
+    """Whether this load will re-separate the instrumental."""
+    return bool(_RESTEM_FROM_INST and model is not None and _INST_AUTO
+                and (inst_model is not None or "instrumental" in _saved_cover)
+                and "stems" not in _saved_cover)
+
+
+def restem_from_instrumental(cancel=None):
+    """Run unwa's instrumental through the six-stem model; keep its stems."""
+    if not _RESTEM_FROM_INST or model is None or not state.stems:
+        return False
+    if state.instrumental is None or getattr(state, "instrumental_is_quick", True):
+        # The quick instrumental is just the six stems added together:
+        # separating it again would give back what is already there.
+        return False
+    if cancel is not None and cancel.is_set():
+        return False
+    import tempfile
+    # A fresh name every time: the audio reader caches by file name, so a
+    # reused name would hand back the previous song's instrumental.
+    tmp = os.path.join(tempfile.gettempdir(),
+                       f"ramma_inst_{os.getpid()}_{int(time.time() * 1000)}.wav")
+    print("[Re-stem] Separating unwa's instrumental with the six-stem model "
+          "for cleaner drums, bass, guitar, piano and other…")
+    if running:
+        app.after(0, lambda: _set_inst_status_text("RE-STEMMING…", "#ffaa00"))
+    res = {}
+    t0 = time.time()
+    try:
+        sf.write(tmp, np.asarray(state.instrumental, dtype=np.float32), 44100,
+                 subtype="FLOAT")
+        _pass_acquire("re-stem from instrumental")
+        try:
+            _model_on_gpu(model)
+            if running:
+                app.after(0, lambda: _set_inst_progress(0.0))
+            separate(tmp, into=res, cancel=cancel,
+                     progress=lambda v: running and app.after(
+                         0, lambda v=v: _set_inst_progress(v)))
+        finally:
+            _model_off_gpu(model)
+            _pass_release()
+            if running:
+                app.after(0, _clear_inst_progress)
+    except Exception as e:
+        print(f"[Re-stem] Failed ({e}) — keeping the stems from the full mix")
+        return False
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        if running:
+            app.after(0, _update_inst_status_label)
+
+    new = res.get("stems")
+    if not new or (cancel is not None and cancel.is_set()) or not state.stems:
+        return False
+    with audio_lock:
+        for k in _RESTEM_KEYS:
+            if k in new and k in state.stems:
+                dst = state.stems[k]
+                n = min(len(dst), len(new[k]))
+                dst[:n] = new[k][:n]
+                if n < len(dst):
+                    dst[n:] = 0.0
+        # The new OTHER is the new full OTHER. If strings already exist (a
+        # SEPARATE NOW ran first), take them out straight away rather than
+        # leaving them doubled until the chain's own strings pass.
+        _other_full[0] = state.stems["other"].copy()
+        if state.strings_data is not None:
+            _subtract_strings_from_other(state.strings_data)
+    print(f"[Re-stem] Done in {time.time() - t0:.1f}s — drums, bass, guitar, "
+          f"piano and other now come from the instrumental")
+    if running:
+        app.after(0, _inst_becomes_vca)
+    return True
+
+
+def _inst_becomes_vca():
+    """INST turns into the control for the stems taken from it.
+
+    Any stems the overlap rule had muted (so INST's audio was not doubled)
+    are released, and INST itself is un-muted: as a control, muting it
+    would now mean silencing all of its stems.
+    """
+    state.inst_is_vca = True
+    for _k in list(_inst_muted_by_us):
+        state.stem_mute[_k] = False
+    _inst_muted_by_us.clear()
+    state.stem_mute[_inst_key] = False
+    for _k in (_inst_key,) + _INST_CHILDREN:
+        try:
+            _paint_ms(_k)
+        except (NameError, KeyError):
+            pass
+    try:
+        _update_inst_status_label()
+    except Exception:
+        pass
+
+
+def _set_inst_status_text(text, colour):
+    lbl = globals().get("_inst_status_lbl")
+    if lbl is not None:
+        try:
+            lbl.configure(text=text, text_color=colour)
+        except Exception:
+            pass
+
+
 def _run_post_stem_chains(path, cancel):
     """The two chains that follow the six-stem pass, side by side.
 
@@ -5867,6 +6467,10 @@ def _run_post_stem_chains(path, cancel):
             print("[Karaoke] AUTO SEPARATE is off — press SEPARATE NOW to "
                   "split the vocals")
             return
+        if state.vocals_lq:
+            print("[Karaoke] LQ VOCAL is on, so karaoke is off — press "
+                  "SEPARATE NOW to split the LQ vocal")
+            return
         if not cancel.is_set():
             separate_bg_vocals(cancel=cancel)
             report_split_result()
@@ -5878,12 +6482,21 @@ def _run_post_stem_chains(path, cancel):
                 and strings_model is not None):
             separate_strings(cancel=cancel)
 
-    threads = [threading.Thread(target=_vocal_chain, daemon=True),
-               threading.Thread(target=_strings_chain, daemon=True)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    # The re-stem goes first: the strings model reads OTHER, so it has to see
+    # the cleaner OTHER the instrumental gives.
+    if not cancel.is_set() and "stems" not in _saved_cover:
+        restem_from_instrumental(cancel=cancel)
+    if _fixes_deferred[0]:
+        _fixes_deferred[0] = False
+        _apply_saved_fixes()
+
+    # One after the other, in a fixed order: HQ vocals, then karaoke, then
+    # strings last — strings take longest, so everything else is ready to
+    # listen to while they run. Started side by side, the two chains raced
+    # for the GPU and the order changed from song to song.
+    _vocal_chain()
+    if not cancel.is_set():
+        _strings_chain()
 
 
 def load_file_path(path):
@@ -5898,6 +6511,9 @@ def load_file_path(path):
         return
     if not model_ready:
         print("[Loadlist] Model still loading — try again in a moment")
+        return
+    if _is_atmos_file(path):
+        import_atmos_bed(path)          # a Dolby / multichannel file: a bed
         return
 
     # A loadlist entry is just a shortcut to loading that file: cancel
@@ -5931,9 +6547,6 @@ def load_file_path(path):
         _kara_load_first(path, cancel)
         # LOAD FIRST: the strings model runs on the track itself, so it can
         # go before the six-stem pass and fill its cell that much sooner.
-        if (_STR_AUTO and _STR_FIRST and not cancel.is_set()
-                and strings_model is not None and "strings" not in _saved_cover):
-            separate_strings(path, cancel=cancel)
         if _INST_AUTO and _INST_CONCURRENT:
             t_inst = threading.Thread(target=_run_low_priority, args=(_inst_or_saved, path),
                                       kwargs={"cancel": cancel}, daemon=True)
@@ -6022,6 +6635,37 @@ def _is_oom(err):
     """True for a GPU out-of-memory error."""
     text = str(err).lower()
     return "out of memory" in text or "cuda error: out of memory" in text
+
+
+def _model_on_gpu(m):
+    """Move a model onto the GPU for its pass."""
+    if m is not None and device.type != "cpu":
+        try:
+            m.to(device)
+        except Exception as e:
+            print(f"[VRAM] Could not move the model to the GPU: {e}")
+    return m
+
+
+def _model_off_gpu(m):
+    """Return a model to system RAM and give its VRAM back.
+
+    Every model used to stay on the GPU from start-up, so five of them sat
+    there together — about 15 GB before anything was separated — and a pass
+    then had no room for its own working memory and ran out. Now a model
+    occupies the GPU only while it is actually separating, and passes run
+    one at a time, so only one model is ever there.
+    """
+    if m is None or device.type == "cpu":
+        return
+    try:
+        m.to("cpu")
+    except Exception as e:
+        print(f"[VRAM] Could not move the model off the GPU: {e}")
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _fg_enter(tag="pass"):
@@ -6122,24 +6766,115 @@ def _reset_pass_flags():
             pass
 
 
-def _clear_solos():
-    """Release every solo when a new track loads.
+_pending_new_song_reset = [False]
 
-    A solo left on INSTRUM, or on a cell the new track has not produced yet,
-    would silence the whole new track — solo mutes everything else.
+
+def _apply_new_song_reset():
+    """The new song is taking over: release solos, and reset the mixer.
+
+    Called the moment the new song's audio replaces the old — when its
+    stems land (or its saved stems are imported, or an Atmos bed replaces
+    it) — rather than when it was picked. The settings change right here,
+    on whatever thread is committing the stems, so the commit's own mutes
+    (FRT/BG VOX while empty, INST while the stems carry the song) go on
+    after them; the controls catch up on the UI thread.
     """
     global _inst_autosolo_active
+    if not _pending_new_song_reset[0]:
+        return
+    _pending_new_song_reset[0] = False
+    # The old song's strings go now, not when the new song was picked: its
+    # OTHER has the strings taken out, so dropping them early left the
+    # playing song with no strings at all.
+    if "strings" not in _saved_cover:     # saved strings arrive before the stems
+        state.strings_data = None
+    _other_full[0] = None
+    # A bed that was playing goes now too — not when the new song was picked
+    # (it kept playing until here), and never on top of the new one.
+    _clear_bed()
+    keep = globals().get("_keep_mix_var")
+    keep_settings = keep is not None and bool(keep.get())
     if any(state.stem_solo.values()):
         print("[Load] Releasing solos from the previous track")
     state.stem_solo.clear()
     _inst_autosolo_active = False
+    if not keep_settings:
+        reset_mixer_settings(ui=False)
+    if running:
+        app.after(0, lambda: reset_mixer_settings(state_part=False)
+                  if not keep_settings else _paint_all_ms())
+
+
+def reset_mixer_settings(ui=True, state_part=True):
+    """Every cell back to its starting point, for a new song.
+
+    Faders to 1.0, pan centred, width 1.0, EQ flat, dynamics off, and any
+    mutes or solos you set released (the program's own mutes, such as INST
+    while the stems carry the song, are then re-applied by the load itself).
+    """
+    if not state_part:
+        return _reset_mixer_controls()
+    with audio_lock:
+        state.stem_volumes = {k: 1.0 for k in state.stem_volumes}
+        for attr in ("fv_volume", "bg_vocals_volume", "strings_volume",
+                     "instrumental_vol", "any_volume"):
+            if hasattr(state, attr):
+                setattr(state, attr, 1.0)
+        for k in _ATMOS_KEYS:
+            setattr(state, f"{k}_volume", 1.0)
+        state.stem_pan.clear()
+        state.stem_widths.clear()
+        state.stem_debleed.clear()
+        for k in list(state.eq_bands):
+            state.eq_bands[k] = [0] * 5
+        for name in dir(state):
+            if name.startswith(("stem_comp_", "stem_gate_", "stem_lim_", "stem_lvl_")):
+                d = getattr(state, name, None)
+                if isinstance(d, dict):
+                    d.clear()
+        state.stem_mute.clear()
+        state.stem_mute["instrumental"] = True
+        state.stem_solo.clear()
+    if not running or not ui:
+        return
+    _reset_mixer_controls()
+
+
+def _reset_mixer_controls():
+    """Bring every control in line with freshly reset settings."""
+    # The controls follow: every fader and knob to its default, buttons
+    # repainted, and the EQ and dynamics windows rebuilt from the clean
+    # settings the next time they open.
     try:
+        import customtkinter as _ctk
+        def _walk(w):
+            for c in w.winfo_children():
+                if isinstance(c, _ctk.CTkSlider) and hasattr(c, "_reset_value"):
+                    _reset_slider(c, c._reset_value)
+                _walk(c)
+        for _grid in (mixer_grid, atmos_grid):
+            _walk(_grid)
         _paint_all_ms()
-    except (NameError, KeyError):
-        pass
+    except Exception as e:
+        print("[Mixer] Resetting the controls:", e)
+    for _w in list((globals().get("_dyn_windows") or {}).values()):
+        try:
+            _w.destroy()
+        except Exception:
+            pass
+    (globals().get("_dyn_windows") or {}).clear()
+    _eqw = globals().get("_eq_window")
+    if _eqw is not None:
+        try:
+            _eqw.destroy()
+        except Exception:
+            pass
+        globals()["_eq_window"] = None
+    print("[Mixer] New song — mixer settings reset (tick KEEP MIX SETTINGS "
+          "to carry them over)")
 
 
-def _unload_track_extras():
+def _unload_track_extras(cancel_bed=True):
     """Drop everything derived from the previous track when a new one loads.
 
     FRT VOX and BG VOX are the previous track's vocal, split in two. The
@@ -6153,17 +6888,24 @@ def _unload_track_extras():
     """
     state.vocals_refined = False
     state.vocals_is_vca = False
-    state.stem_invert.clear()
+    state.inst_is_vca = False
+    if cancel_bed:
+        _cancel_bed_job()      # a bed still separating gives way; one that is
+                               # playing stays until the new song takes over
+    state.vocals_lq = False
+    _vocals_6stem[0] = None
+    _vocals_hq[0] = None
+    _halves_hq[0] = None
     if running:
-        for _k in list(_invert_btns):
-            app.after(0, lambda k=_k: _paint_invert(k))
+        app.after(0, _paint_lq_button)
+    # The mixer reset (when KEEP MIX SETTINGS is off) waits for the new song
+    # too — it happens in _apply_new_song_reset.
+    _pending_new_song_reset[0] = True
     if running:
         app.after(0, _show_vocals_cell)
         app.after(0, _update_vocals_status)
     state.fv_data        = None
     state.bg_vocals_data = None
-    state.strings_data   = None
-    state.strings_is_quick = False
     if running:
         app.after(0, _update_strings_status_label)   # WAITING, straight away
     state.instrumental   = None
@@ -6215,7 +6957,10 @@ def _start_load(path, job_inner):
     _reset_pass_flags()
     old_thread = _cancel_current_load()
     _set_current_track(path)
-    _clear_solos()
+    # The song that is playing keeps its mutes and solos until the new one
+    # takes over (see _apply_new_song_reset); releasing them here changed
+    # what you were listening to the moment you picked the next song.
+    _pending_new_song_reset[0] = True
     _reset_instrumental_overlap()
     _unload_track_extras()
 
@@ -6269,76 +7014,6 @@ def _start_load(path, job_inner):
             pass
 
 
-def _claim_load_slot(path):
-    """Mark a load as running (used by the instant, cache-free paths)."""
-    with _load_claim_lock:
-        _load_running[0] = True
-        state.separating = True
-        return True
-
-
-def _release_load_slot():
-    with _load_claim_lock:
-        _load_running[0] = False
-
-
-def _apply_loaded_result(path, cached):
-    """Put an already-separated result into the player straight away."""
-    state.current_audio_name = os.path.splitext(os.path.basename(path))[0]
-    state.loaded_audio_name  = state.current_audio_name
-    state._stem_export_state = {}
-    state.waveform_data = cached.get("waveform")
-    if state.waveform_data is None and cached.get("instrumental") is not None:
-        _mono = np.mean(cached["instrumental"], axis=1)
-        state.waveform_data = _mono[::max(1, len(_mono) // 2000)]
-
-    stems_cached = cached.get("stems")
-    with audio_lock:
-        state.stems = stems_cached
-        if stems_cached:
-            state.stem_volumes = {k: state.stem_volumes.get(k, 1.0)
-                                  for k in stems_cached}
-        state.sr           = cached.get("sr", 44100)
-        state.position     = 0
-        _eq_zi_state.clear()
-    state.instrumental = cached.get("instrumental")
-    state.bg_vocals_data = cached.get("bg_vocals")
-    if state.bg_vocals_data is not None:
-        state.bg_vocals_sr = cached.get("sr", 44100)
-    state.fv_data = cached.get("front_vocals")
-    if state.fv_data is not None:
-        state.fv_sr = cached.get("sr", 44100)
-    state.instrumental_is_quick = bool(cached.get("instrumental_quick", False))
-    state.loop_start = state.loop_end = None
-
-    state.separating = False
-    threading.Thread(target=_prewarm_reverb, daemon=True).start()
-    print(f"[Preload] Loaded {os.path.basename(path)!r} from cache — no wait")
-
-    if running:
-        progress_bar.pack_forget()
-        _clear_progress()
-        wave_canvas.pack(fill="both", expand=True)
-        for b in _all_import_btns():
-            b.configure(state="normal")
-        _unlock_transport()
-        _update_inst_status_label()
-        _update_bgv_button()
-        _update_fv_button()
-        _mute_vocal_cells()
-        _playlist_refresh()
-        _apply_pending_autosolo()
-        _flash_track_name(state.current_audio_name)
-
-
-def _prewarm_reverb():
-    """Pre-initialise the shared reverb bus on a background thread so the
-    first reverb slider move is instant and never blocks the audio callback."""
-    if state.sr is None:
-        return
-    _prewarm_reverb_bus(int(state.sr))
-
-
 def _update_inst_status_label():
     """Refresh the status pill in the instrumental cell.
 
@@ -6354,6 +7029,8 @@ def _update_inst_status_label():
         lbl.configure(text="AUTO OFF", text_color=TEXT_DIM)
     elif _inst_separating:
         lbl.configure(text="SEPARATING...", text_color=TEXT_DIM)
+    elif getattr(state, "inst_is_vca", False):
+        lbl.configure(text="VCA → STEMS", text_color="#44cc44")
     elif state.instrumental is not None:
         if state.instrumental_is_quick:
             lbl.configure(text="QUICK MIX", text_color="#ffaa00")
@@ -6365,7 +7042,7 @@ def _update_inst_status_label():
         lbl.configure(text="WAITING", text_color=TEXT_DIM)
 
 
-def separate(path, into=None, cancel=None):
+def separate(path, into=None, cancel=None, progress=None):
     """Separate *path* into 6 stems using BS-RoFormer-SW (bs-roformer-infer).
 
     Runs entirely in-process with PyTorch — no temp files, no onnxruntime.
@@ -6383,6 +7060,13 @@ def separate(path, into=None, cancel=None):
 
     def update(v):
         if bg:
+            # Result-only mode keeps the main bar alone, but a caller can
+            # still follow along (the re-stem shows it on the INST cell).
+            if progress is not None:
+                try:
+                    progress(v)
+                except Exception:
+                    pass
             return
         if running:
             app.after(0, lambda: _set_progress(v))
@@ -6434,6 +7118,7 @@ def separate(path, into=None, cancel=None):
             return
     else:
         _fg_enter("six-stem")
+        _model_on_gpu(model)
     try:
         run_device  = device
         sr_i        = _MODEL_SR
@@ -6461,7 +7146,8 @@ def separate(path, into=None, cancel=None):
 
         # Several chunks go through the model at once, so the GPU has real
         # work queued instead of stalling between one-chunk passes.
-        batch_n  = _batch_size_for(run_device, chunk_s)
+        _probe = _BatchProbe(run_device, _batch_size_for(run_device, chunk_s), "BS-RoFormer")
+        batch_n = _probe.start()
         use_fp16 = _INFER_FP16
         _release_vram()
         print(f"[BS-RoFormer] {n_chunks} chunks of {chunk_s:g}s, batch {batch_n}, "
@@ -6553,6 +7239,7 @@ def separate(path, into=None, cancel=None):
                     wgt[start:start + actual]    += fade[:actual]
 
                 ci += len(batch_starts)
+                batch_n = _probe.after(batch_n)   # fit batches to the card
                 update(0.25 + 0.65 * ci / n_chunks)
 
         # Normalise overlap-add
@@ -6569,6 +7256,7 @@ def separate(path, into=None, cancel=None):
         return
     finally:
         if not bg:
+            _model_off_gpu(model)
             _fg_leave()
 
     update(0.92)
@@ -6599,6 +7287,12 @@ def separate(path, into=None, cancel=None):
 
     state.waveform_data = wave_snapshot
 
+    # Before taking the lock: the reset takes it too, and it is not re-entrant.
+    _apply_new_song_reset()              # the new song takes over now
+    # The HQ vocals model later overwrites this stem in place, so keep the
+    # original for the LQ VOCAL switch.
+    _vocals_6stem[0] = new_stems["vocals"].copy() if "vocals" in new_stems else None
+    _other_full[0] = new_stems["other"].copy() if "other" in new_stems else None
     with audio_lock:
         state.stems        = new_stems
         state.loaded_audio_name = state.current_audio_name
@@ -6608,8 +7302,13 @@ def separate(path, into=None, cancel=None):
         _eq_zi_state.clear()   # reset IIR filter state for new track
 
     # Any fixes saved for this track go on before anything is played, so the
-    # audio is in the stems the user corrected it to last time.
-    _apply_saved_fixes()
+    # audio is in the stems the user corrected it to last time — unless the
+    # instrumental is about to replace five of these stems, in which case
+    # they wait and go onto the final stems instead (see restem_from_instrumental).
+    if _restem_will_run():
+        _fixes_deferred[0] = True
+    else:
+        _apply_saved_fixes()
 
     # No stand-in for STRINGS any more: OTHER holds the strings until the
     # model has run and taken them out, so copying OTHER into STRINGS would
@@ -6627,7 +7326,6 @@ def separate(path, into=None, cancel=None):
                 app.after(0, _update_inst_status_label)
 
     state.separating = False
-    threading.Thread(target=_prewarm_reverb, daemon=True).start()
     update(1.0)
 
     if running:
@@ -6683,7 +7381,7 @@ def export_mix():
     """
     if state.stems is None or not state.export_folder:
         return
-    if not state.export_fmt_wav24 and not state.export_fmt_mp3 and not state.export_fmt_mp3_256:
+    if not _export_formats():
         return
 
     base = state.loaded_audio_name or state.current_audio_name or "mix"
@@ -6691,10 +7389,7 @@ def export_mix():
     ex_start, ex_end, loop_suffix = _loop_region_samples()
     length            = ex_end - ex_start   # may be full file or loop region
 
-    formats = []
-    if state.export_fmt_wav24:   formats.append(("wav24",   ".wav"))
-    if state.export_fmt_mp3:     formats.append(("mp3",     ".mp3"))
-    if state.export_fmt_mp3_256: formats.append(("mp3_256", "_256k.mp3"))
+    formats = _export_formats()
 
     def _do():
         block      = 4096
@@ -6736,12 +7431,6 @@ def export_mix():
             app.after(0, stop)
             import time; time.sleep(0.12)   # let the callback drain
 
-        # Flush both reverb buses so stale delay-line state from live
-        # playback does not bleed into the first block of the rendered output.
-        sr_i_local = int(state.sr)
-        _shared_reverb._reset(sr_i_local)
-        _master_reverb._reset(sr_i_local)
-
         for bi in range(n_blocks):
             pos   = bi * block
             frs   = min(block, length - pos)
@@ -6750,10 +7439,6 @@ def export_mix():
             _prog((bi + 1) / total_jobs)
 
         np.clip(rendered, -1.0, 1.0, out=rendered)
-
-        # Restore clean reverb state so live playback sounds correct after export.
-        _shared_reverb._reset(sr_i_local)
-        _master_reverb._reset(sr_i_local)
 
         for fi, (fmt, ext) in enumerate(formats):
             _prog((n_blocks + fi) / total_jobs, f"WRITING MIX ({ext[1:].upper()})…")
@@ -6789,75 +7474,46 @@ def _stem_settings_hash(name):
         vol_now = state.stem_volumes.get(name, 1.0)
     h.update(struct.pack("f", vol_now))
     h.update(struct.pack("f", state.stem_widths.get(name, 1.0)))
-    h.update(struct.pack("f", state.stem_reverbs.get(name, 0.0)))
-    h.update(struct.pack("f", state.stem_air.get(name, 0.0)))
     h.update(struct.pack("ff", state.volume_master, state.stereo_width))
     return h.hexdigest()
 
 
-def render_stem(name):
-    """Return the full processed audio for a single Demucs stem as a float32
-    array, applying: EQ → VFF (vocals only) → stereo width → air → volume.
-    Reverb is applied by processing the signal in chunks through a fresh
-    reverb instance so the exported audio matches what you hear during playback.
+def _export_formats():
+    """[(format, file ending), ...] for everything ticked, in a fixed order.
+
+    When two of the same kind are ticked (16- and 24-bit), the 24-bit file
+    is marked in its name so the two do not overwrite each other; on its
+    own, each format keeps the plain ending.
     """
-    raw  = state.stems[name]                      # (N, 2) float32 — unprocessed
-    sr_i = int(state.sr)
-
-    # --- Stage 1: EQ → VFF → dynamics → width → pan → air (all stateless/single-pass)
-    chunk = apply_eq(raw.copy(), sr_i, state.eq_bands.get(name, [0]*5))
-    if name == "vocals" and state.vff_enabled:
-        chunk = apply_vff(chunk)
-    chunk = apply_dynamics(
-        chunk, name + "_export",
-        state.stem_comp_enabled.get(name, False),
-        state.stem_comp_thresh.get(name,  _COMP_DEFAULTS["thresh"]),
-        state.stem_comp_ratio.get(name,   _COMP_DEFAULTS["ratio"]),
-        state.stem_comp_attack.get(name,  _COMP_DEFAULTS["attack"]),
-        state.stem_comp_release.get(name, _COMP_DEFAULTS["release"]),
-        state.stem_gate_enabled.get(name, False),
-        state.stem_gate_thresh.get(name,  _GATE_DEFAULTS["thresh"]),
-        state.stem_gate_attack.get(name,  _GATE_DEFAULTS["attack"]),
-        state.stem_gate_release.get(name, _GATE_DEFAULTS["release"]),
-        sr_i)
-    chunk = apply_stem_width(chunk, state.stem_widths.get(name, 1.0))
-    chunk = apply_pan(chunk, state.stem_pan.get(name, 0.0))
-    chunk = apply_air(chunk, state.stem_air.get(name, 0.0), sr_i)
-
-    # --- Stage 2: volume
-    vol = state.stem_volumes.get(name, 1.0)
-    chunk = chunk * vol
-
-    # --- Stage 3: reverb (stateful — process in 4096-sample blocks with a
-    #     fresh reverb instance so we don't disturb live playback state)
-    rev_amt = state.stem_reverbs.get(name, 0.0)
-    if rev_amt > 0.001:
-        export_reverb = _SharedReverb()
-        export_reverb._reset(sr_i)
-        block   = 4096
-        n_samp  = len(chunk)
-        out_rev = np.zeros_like(chunk)
-        for i in range(0, n_samp, block):
-            blk     = chunk[i:i+block]
-            send    = np.clip(blk, -1.0, 1.0) * rev_amt
-            wet     = export_reverb.process(send, sr_i)
-            out_rev[i:i+block] = blk + wet
-        chunk = out_rev
-
-    np.clip(chunk, -1.0, 1.0, out=chunk)
-    return chunk
+    out = []
+    flacs = state.export_fmt_flac16 and state.export_fmt_flac24
+    wavs = state.export_fmt_wav16 and state.export_fmt_wav24
+    if state.export_fmt_flac16: out.append(("flac16", ".flac"))
+    if state.export_fmt_flac24: out.append(("flac24", "_24bit.flac" if flacs else ".flac"))
+    if state.export_fmt_wav16:  out.append(("wav16",  ".wav"))
+    if state.export_fmt_wav24:  out.append(("wav24",  "_24bit.wav" if wavs else ".wav"))
+    if state.export_fmt_mp3:     out.append(("mp3",     ".mp3"))
+    if state.export_fmt_mp3_256: out.append(("mp3_256", "_192k.mp3"))   # 192 kbps
+    return out
 
 
 def _write_stem_file(data_f32, sr_val, out_path, fmt):
     """Write stem audio to out_path in the requested format.
     fmt: 'wav24'    → WAV PCM 24-bit
          'mp3'      → MP3 320 kbps (requires pydub + ffmpeg)
-         'mp3_256'  → MP3 256 kbps (requires pydub + ffmpeg)
+         'mp3_256'  → MP3 192 kbps (requires pydub + ffmpeg; the setting
+                      kept its old name so saved preferences still apply)
     """
     if fmt == "wav24":
         sf.write(out_path, data_f32, sr_val, subtype="PCM_24")
+    elif fmt == "wav16":
+        sf.write(out_path, data_f32, sr_val, subtype="PCM_16")
+    elif fmt == "flac16":
+        sf.write(out_path, data_f32, sr_val, format="FLAC", subtype="PCM_16")
+    elif fmt == "flac24":
+        sf.write(out_path, data_f32, sr_val, format="FLAC", subtype="PCM_24")
     elif fmt in ("mp3", "mp3_256"):
-        bitrate = "320k" if fmt == "mp3" else "256k"
+        bitrate = "320k" if fmt == "mp3" else "192k"
         try:
             from pydub import AudioSegment
             pcm16 = (np.clip(data_f32, -1.0, 1.0) * 32767).astype(np.int16)
@@ -6932,21 +7588,13 @@ def export_selected_stems(only=None, default_wav=False):
                             else state.stem_volumes.get(n, 1.0))
                         for n in selected}
         width_snap   = {n: state.stem_widths.get(n, 1.0)     for n in selected}
-        rev_snap     = {n: state.stem_reverbs.get(n, 0.0)    for n in selected}
-        air_snap     = {n: state.stem_air.get(n, 0.0)        for n in selected}
         vff_snap     = state.vff_enabled
 
-    formats = []
-    if state.export_fmt_wav24:
-        formats.append(("wav24",   ".wav"))
-    if state.export_fmt_mp3:
-        formats.append(("mp3",     ".mp3"))
-    if state.export_fmt_mp3_256:
-        formats.append(("mp3_256", "_256k.mp3"))
+    formats = _export_formats()
     if not formats:
         if not default_wav:
             return
-        formats.append(("wav24", ".wav"))
+        formats.append(("flac16", ".flac"))
 
     base = state.loaded_audio_name or state.current_audio_name or "stem"
     hash_snap     = {n: _stem_settings_hash(n) for n in selected}
@@ -6989,22 +7637,7 @@ def export_selected_stems(only=None, default_wav=False):
                 if name == "vocals" and vff_snap:
                     chunk = apply_vff(chunk)
                 chunk = apply_stem_width(chunk, width_snap[name])
-                chunk = apply_air(chunk, air_snap[name], sr_i)
                 chunk = chunk * vol_snap[name]
-
-                rev_amt = rev_snap[name]
-                if rev_amt > 0.001:
-                    export_reverb = _SharedReverb()
-                    export_reverb._reset(sr_i)
-                    block  = 4096
-                    n_samp = len(chunk)
-                    out_rv = np.zeros_like(chunk)
-                    for i in range(0, n_samp, block):
-                        blk          = chunk[i:i+block]
-                        wet          = export_reverb.process(
-                                           np.clip(blk, -1.0, 1.0) * rev_amt, sr_i)
-                        out_rv[i:i+block] = blk + wet
-                    chunk = out_rv
 
                 np.clip(chunk, -1.0, 1.0, out=chunk)
 
@@ -7553,19 +8186,20 @@ def _resample_audio(audio, file_sr):
     return np.stack([ch0, ch1], axis=1)
 
 
-_ATMOS_KEYS = ("atmos_fl", "atmos_fr", "atmos_c", "atmos_lfe", "atmos_bl", "atmos_br")
+_ATMOS_KEYS = ("atmos_front", "atmos_center", "atmos_rear")
+_ATMOS_LABELS = {"atmos_front": "FRONT", "atmos_center": "CENTER",
+                 "atmos_rear": "REAR"}
 
 
 def _all_import_btns():
     """Every import button that exists right now.
 
-    Cells come and go (ANY+ and ANY++ were removed), and their globals stay
-    behind as None. Enabling one of those raised inside the load-completion
-    block, which is why the transport never lit up after a separation.
+    A cell that is not on screen leaves its global as None; enabling one of
+    those raised inside the load-completion block, which is why the
+    transport once never lit up after a separation.
     """
     names = ("bgv_import_btn", "fv_import_btn", "hl_import_btn",
-             "any_import_btn", "any_plus_import_btn",
-             "any_plusplus_import_btn")
+             "any_import_btn")
     out = [globals().get(n) for n in names]
     out += _atmos_import_btns()
     return [b for b in out if b is not None]
@@ -7620,69 +8254,11 @@ def _read_audio_file(path):
     return audio, file_sr
 
 
-def load_front_vocals():
-    """Import Front Vocals from a file.
-
-    No longer wired to a button: the FRT VOX cell is the lead half of the
-    karaoke split (see separate_bg_vocals). Kept so presets and any other
-    caller still work.
-    """
-    if _playable_length() == 0 or state.separating:
-        return
-    path = filedialog.askopenfilename(
-        title="Import Front Vocals",
-        initialdir=state.last_fv_dir,
-        filetypes=[("Audio files", "*.wav *.flac *.mp3 *.ogg *.aif *.aiff *.m4a *.aac *.mp4 *.m4v *.mov"), ("All files", "*.*")]
-    )
-    if not path:
-        return
-    state.last_fv_dir = os.path.dirname(path)
-    try:
-        audio, file_sr = _read_audio_file(path)
-        state.fv_data = _resample_audio(audio, file_sr)
-        state.fv_sr   = state.sr
-        name_no_ext = os.path.splitext(os.path.basename(path))[0]
-        fv_import_btn.configure(text=f"⬡ {name_no_ext[:18]}")
-    except Exception as e:
-        print("Front Vocals load error:", e)
-
-
-
-
 def apply_bgv_vff(chunk):
     """Vocal Focus Filter for the BG Vocals stem."""
     return _vff_process(chunk, state.bgv_vff_enabled,
                         float(state.bgv_vff_lead_cut), float(state.bgv_vff_body_cut),
                         float(state.bgv_vff_presence), float(state.bgv_vff_bkg_vol), "bgv")
-
-
-def load_bg_vocals():
-    """Import BG Vocals from a file.
-
-    No longer wired to a button: the BG VOX cell is produced by the
-    karaoke model (see separate_bg_vocals). Kept so presets and any other
-    caller still work, and so the old behaviour is one line away.
-    """
-    if _playable_length() == 0 or state.separating:
-        return
-    path = filedialog.askopenfilename(
-        title="Import BG Vocals",
-        initialdir=state.last_bgv_dir,
-        filetypes=[("Audio files", "*.wav *.flac *.mp3 *.ogg *.aif *.aiff *.m4a *.aac *.mp4 *.m4v *.mov"), ("All files", "*.*")]
-    )
-    if not path:
-        return
-    state.last_bgv_dir = os.path.dirname(path)
-    try:
-        audio, file_sr = _read_audio_file(path)
-        state.bg_vocals_data = _resample_audio(audio, file_sr)
-        state.bg_vocals_sr   = state.sr
-        name_no_ext = os.path.splitext(os.path.basename(path))[0]
-        bgv_import_btn.configure(text=f"⬡ {name_no_ext[:18]}")
-    except Exception as e:
-        print("BG Vocals load error:", e)
-
-
 
 
 def apply_hl_vff(chunk):
@@ -7722,14 +8298,6 @@ def apply_leveller(chunk: np.ndarray,
     gain = 1.0 + (threshold / rms - 1.0) * float(amount)
     gain = max(0.125, min(gain, 4.0))
     return chunk * np.float32(gain)
-
-
-def apply_hl_leveller(chunk):
-    """Leveller for the Hidden Layer stem (legacy wrapper)."""
-    return apply_leveller(chunk,
-                          state.stem_lvl_enabled.get("hidden_layer", False),
-                          state.stem_lvl_threshold.get("hidden_layer", 0.3),
-                          state.stem_lvl_amount.get("hidden_layer", 0.5))
 
 
 # ----------------------------
@@ -7837,7 +8405,6 @@ def load_hidden_layer():
     try:
         audio, file_sr = _read_audio_file(path)
         state.hl_data = _resample_audio(audio, file_sr)
-        state.hl_sr   = state.sr
         name_no_ext = os.path.splitext(os.path.basename(path))[0]
         hl_import_btn.configure(text=f"⬡ {name_no_ext[:18]}")
     except Exception as e:
@@ -7882,14 +8449,6 @@ def _make_atmos_loader(key, label, btn_name):
     return _load
 
 
-load_atmos_fl = _make_atmos_loader("atmos_fl", "ATMOS FL", "atmos_fl_import_btn")
-load_atmos_fr = _make_atmos_loader("atmos_fr", "ATMOS FR", "atmos_fr_import_btn")
-load_atmos_c = _make_atmos_loader("atmos_c", "ATMOS C", "atmos_c_import_btn")
-load_atmos_lfe = _make_atmos_loader("atmos_lfe", "ATMOS LFE", "atmos_lfe_import_btn")
-load_atmos_bl = _make_atmos_loader("atmos_bl", "ATMOS BL", "atmos_bl_import_btn")
-load_atmos_br = _make_atmos_loader("atmos_br", "ATMOS BR", "atmos_br_import_btn")
-
-
 def load_any():
     """Let the user pick an audio file to use as the Synth stem."""
     if _playable_length() == 0 or state.separating:
@@ -7905,59 +8464,11 @@ def load_any():
     try:
         audio, file_sr = _read_audio_file(path)
         state.any_data = _resample_audio(audio, file_sr)
-        state.any_sr   = state.sr
         name_no_ext = os.path.splitext(os.path.basename(path))[0]
         any_import_btn.configure(text=f"⬡ {name_no_ext[:18]}")
     except Exception as e:
         print("Synth load error:", e)
 
-
-
-def load_any_plus():
-    """Let the user pick an audio file to use as the Strings stem."""
-    if _playable_length() == 0 or state.separating:
-        return
-    path = filedialog.askopenfilename(
-        title="Import — Any+",
-        initialdir=state.last_any_plus_dir,
-        filetypes=[("Audio files", "*.wav *.flac *.mp3 *.ogg *.aif *.aiff *.m4a *.aac *.mp4 *.m4v *.mov"), ("All files", "*.*")]
-    )
-    if not path:
-        return
-    state.last_any_plus_dir = os.path.dirname(path)
-    try:
-        audio, file_sr = _read_audio_file(path)
-        state.any_plus_data = _resample_audio(audio, file_sr)
-        state.any_plus_sr   = state.sr
-        name_no_ext = os.path.splitext(os.path.basename(path))[0]
-        if any_plus_import_btn is not None:      # cell no longer built
-            any_plus_import_btn.configure(text=f"⬡ {name_no_ext[:18]}")
-    except Exception as e:
-        print("Strings load error:", e)
-
-
-
-def load_any_plusplus():
-    """Let the user pick an audio file to use as the FX stem."""
-    if _playable_length() == 0 or state.separating:
-        return
-    path = filedialog.askopenfilename(
-        title="Import — Any++",
-        initialdir=state.last_any_plusplus_dir,
-        filetypes=[("Audio files", "*.wav *.flac *.mp3 *.ogg *.aif *.aiff *.m4a *.aac *.mp4 *.m4v *.mov"), ("All files", "*.*")]
-    )
-    if not path:
-        return
-    state.last_any_plusplus_dir = os.path.dirname(path)
-    try:
-        audio, file_sr = _read_audio_file(path)
-        state.any_plusplus_data = _resample_audio(audio, file_sr)
-        state.any_plusplus_sr   = state.sr
-        name_no_ext = os.path.splitext(os.path.basename(path))[0]
-        if any_plusplus_import_btn is not None:
-            any_plusplus_import_btn.configure(text=f"⬡ {name_no_ext[:18]}")
-    except Exception as e:
-        print("FX load error:", e)
 
 
 # ============================================================
@@ -7968,9 +8479,20 @@ def load_any_plusplus():
 _SESSION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ramma_session.json")
 
 def _all_stem_keys():
-    base = list(state.stems.keys()) if state.stems else []
-    return base + ["front_vocals", "bg_vocals", "hidden_layer",
-                   "any", "any+", "any++", "atmos_fl", "atmos_fr", "atmos_c", "atmos_lfe", "atmos_bl", "atmos_br"]
+    """Every cell a session stores settings for: exactly the mixer's cells.
+
+    This list used to be written out by hand and fell behind — it still
+    named cells that had been removed, and missed STRINGS, INST and the
+    ATMOS tracks, so their settings were never saved.
+    """
+    base = list(state.stems.keys()) if state.stems else list(_STEM_KEYS)
+    return list(dict.fromkeys(base + _mixer_cell_order()))
+
+
+# Cells whose fader lives in its own attribute rather than stem_volumes.
+_CELL_VOLUME_ATTRS = ("fv_volume", "bg_vocals_volume", "strings_volume",
+                      "instrumental_vol", "any_volume", "atmos_front_volume",
+                      "atmos_center_volume", "atmos_rear_volume")
 
 def save_session():
     """Write all current mixer settings to ramma_session.json."""
@@ -7979,12 +8501,8 @@ def save_session():
     data = {
         "volume_master":  s.volume_master,
         "stereo_width":   s.stereo_width,
-        "reverb_master":  s.reverb_master,
-        "air_master":     s.air_master,
         "stem_volumes":   {k: s.stem_volumes.get(k, 1.0)  for k in keys},
         "stem_widths":    {k: s.stem_widths.get(k, 1.0)   for k in keys},
-        "stem_reverbs":   {k: s.stem_reverbs.get(k, 0.0)  for k in keys},
-        "stem_air":       {k: s.stem_air.get(k, 0.0)      for k in keys},
         "stem_pan":       {k: s.stem_pan.get(k, 0.0)      for k in keys},
         "stem_nudge":     {k: s.stem_nudge.get(k, 0)      for k in keys},
         "stem_lvl_enabled":   {k: s.stem_lvl_enabled.get(k, False) for k in keys},
@@ -8006,6 +8524,7 @@ def save_session():
         "stem_gate_release":  {k: s.stem_gate_release.get(k, _GATE_DEFAULTS["release"]) for k in keys},
         "eq_bands":       {k: s.eq_bands.get(k, [0]*5)    for k in s.eq_bands},
         "debleed":        {k: s.stem_debleed.get(k, {})   for k in keys},
+        "cell_volumes":   {a: float(getattr(s, a, 1.0)) for a in _CELL_VOLUME_ATTRS},
     }
     try:
         with open(_SESSION_PATH, "w", encoding="utf-8") as f:
@@ -8015,10 +8534,10 @@ def save_session():
     except Exception as e:
         print("Session save error:", e)
 
-# The three import cells were once keyed "synth", "strings" and "fx". A
-# session saved under those names is translated on load, so its settings land
-# on the cells now called any / any+ / any++ instead of being dropped.
-_LEGACY_STEM_KEYS = {"synth": "any", "strings": "any+", "fx": "any++"}
+# An old session's "synth" cell is today's ANY cell. ("strings" used to be
+# translated too, to the long-gone ANY+ — but STRINGS is a real cell now, and
+# that translation threw its saved settings away on every load.)
+_LEGACY_STEM_KEYS = {"synth": "any"}
 
 
 def _migrate_stem_keys(data):
@@ -8049,13 +8568,9 @@ def load_session():
     s = state
     s.volume_master = float(data.get("volume_master", 0.7))
     s.stereo_width  = float(data.get("stereo_width",  1.0))
-    s.reverb_master = float(data.get("reverb_master", 0.0))
-    s.air_master    = float(data.get("air_master",    0.0))
 
     for k, v in data.get("stem_volumes",  {}).items(): s.stem_volumes[k]  = float(v)
     for k, v in data.get("stem_widths",   {}).items(): s.stem_widths[k]   = float(v)
-    for k, v in data.get("stem_reverbs",  {}).items(): s.stem_reverbs[k]  = float(v)
-    for k, v in data.get("stem_air",      {}).items(): s.stem_air[k]      = float(v)
     for k, v in data.get("stem_pan",      {}).items(): s.stem_pan[k]      = float(v)
     for k, v in data.get("stem_nudge",    {}).items(): s.stem_nudge[k]    = int(v)
     for k, v in data.get("stem_lvl_enabled",   {}).items(): s.stem_lvl_enabled[k]   = bool(v)
@@ -8077,6 +8592,9 @@ def load_session():
     for k, v in data.get("stem_gate_release",  {}).items(): s.stem_gate_release[k]  = float(v)
     for k, v in data.get("eq_bands",      {}).items(): s.eq_bands[k]      = list(v)
     for k, v in data.get("debleed",       {}).items(): s.stem_debleed[k]  = dict(v)
+    for a, v in data.get("cell_volumes",  {}).items():
+        if a in _CELL_VOLUME_ATTRS:
+            setattr(s, a, float(v))
 
     app.after(0, lambda: _session_status_lbl.configure(text="SESSION LOADED ✓"))
     app.after(2000, lambda: _session_status_lbl.configure(text=""))
@@ -8243,13 +8761,6 @@ def open_eq_window():
 
         def _eq_on_canvas_resize(event):
             _eq_schedule()
-        def _eq_mousewheel(event):
-            if event.num == 4:
-                _eq_canvas.yview_scroll(-1, "units")
-            elif event.num == 5:
-                _eq_canvas.yview_scroll(1, "units")
-            else:
-                _eq_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
         frame.bind("<Configure>", _eq_on_configure)
         _eq_canvas.bind("<Configure>", _eq_on_canvas_resize)
@@ -8266,30 +8777,25 @@ def open_eq_window():
             "bg_vocals":    "BG VOX",
             "any":        "ANY",
             "strings":    "STRINGS",
-            "atmos_fl":    "ATMOS FL",
-            "atmos_fr":    "ATMOS FR",
-            "atmos_c":    "ATMOS C",
-            "atmos_lfe":  "ATMOS LFE",
-            "atmos_bl":   "ATMOS BL",
-            "atmos_br":   "ATMOS BR",
-            "any+":      "ANY+",
-            "any++":           "ANY++",
+            "atmos_front":  "ATMOS FRONT",
+            "atmos_center": "ATMOS CENTER",
+            "atmos_rear":   "ATMOS REAR",
             "instrumental": "INST",
         }
         # Exactly the cells the mixer shows, in the order it shows them:
         # the main row left to right, then the ATMOS row. Read from the grid
         # itself, so the matrix keeps up if cells are added or moved, and
-        # cells that were removed (ANY+, ANY++) no longer appear.
+        # cells that were removed no longer appear.
         all_eq_stems = _mixer_cell_order()
         for _k in all_eq_stems:
             state.eq_bands.setdefault(_k, [0] * 5)
         for stem in all_eq_stems:
             label = _EQ_LABELS.get(stem, stem.upper())
-            if stem in ("front_vocals", "bg_vocals", "hidden_layer", "any", "any+", "any++"):
+            if stem in ("front_vocals", "bg_vocals", "hidden_layer", "any"):
                 tk.Frame(frame, bg=STEEL, height=1).pack(fill="x", padx=8, pady=(6, 0))
             ctk.CTkLabel(frame, text=f"── {label} ──",
                          font=FONT_TITLE,
-                         text_color=GLOW_RED if stem not in ("front_vocals", "bg_vocals", "hidden_layer", "any", "any+", "any++") else BRIGHT_RED).pack(pady=(8, 0))
+                         text_color=GLOW_RED if stem not in ("front_vocals", "bg_vocals", "hidden_layer", "any") else BRIGHT_RED).pack(pady=(8, 0))
             row = ctk.CTkFrame(frame, fg_color=BG,
                                corner_radius=0,
                                border_color=STEEL, border_width=1)
@@ -8349,7 +8855,7 @@ header.pack(fill="x", padx=0, pady=0)
 header.pack_propagate(False)
 
 ctk.CTkLabel(header,
-             text="R · A · M · M · A  ──  STEM  ENGINE  v0.667.1",
+             text="R · A · M · M · A  ──  STEM  ENGINE  v0.667.2",
              font=("Courier New", 14, "bold"),
              text_color=GLOW_RED).pack(side="left", padx=20)
 
@@ -8814,6 +9320,7 @@ btn_play = ctk.CTkButton(
     font=FONT_LABEL, corner_radius=0,
     border_width=1, border_color=BORDER, height=34)
 btn_play.pack(side="left", padx=4)
+
 
 btn_stop = ctk.CTkButton(
     transport, text="■ STOP", command=stop,
@@ -9466,25 +9973,25 @@ _atmos_toggle_btn.pack(fill="x")
 
 atmos_grid = ctk.CTkFrame(mixer_outer, fg_color="transparent")
 
-# One file, six cells: load an E-AC-3 (including the streams used for Dolby
-# Atmos) or any multichannel file and its 5.1 bed is spread over the row.
+# A bed is loaded with LOAD like any song: RAMMA recognises a multichannel
+# file and spreads its 5.1 bed over these three cells.
 _atmos_bar = ctk.CTkFrame(mixer_outer, fg_color="transparent")
 
-ctk.CTkButton(_atmos_bar,
-              text="⬡  IMPORT ATMOS BED  (E-AC-3 / 5.1 file)",
-              command=lambda: import_atmos_bed(),
-              fg_color=STEEL, hover_color=STEEL_LIGHT,
-              text_color=TEXT_MAIN, font=("Courier New", 13, "bold"),
-              corner_radius=0, border_width=1, border_color=BRIGHT_RED,
-              height=26, width=340).pack(side="left", padx=(4, 8))
-
 ctk.CTkButton(_atmos_bar, text="✕  CLEAR BED",
-              command=lambda: [_clear_import(k, globals().get(f"{k}_import_btn"))
-                               for k in _51_TO_CELL],
+              command=lambda: (_cancel_bed_job(), _clear_bed(),
+                               [_clear_import(k, globals().get(f"{k}_import_btn"))
+                                for k in _ATMOS_KEYS]),
               fg_color=STEEL, hover_color=MUTE_ON,
               text_color=TEXT_DIM, font=("Courier New", 13, "bold"),
               corner_radius=0, border_width=1, border_color=BORDER,
-              height=26, width=150).pack(side="left")
+              height=26, width=150).pack(side="left", padx=(4, 0))
+
+ctk.CTkButton(_atmos_bar, text="⟳  SEPARATE BED",
+              command=lambda: start_atmos_separation(),
+              fg_color=STEEL, hover_color=STEEL_LIGHT,
+              text_color=BRIGHT_GREEN, font=("Courier New", 13, "bold"),
+              corner_radius=0, border_width=1, border_color=BORDER,
+              height=26, width=180).pack(side="left", padx=(8, 0))
 
 ctk.CTkLabel(_atmos_bar,
              text="FFmpeg decodes the 5.1 bed; Atmos height objects are not rendered",
@@ -9498,11 +10005,11 @@ def _atmos_set_open(open_it):
         atmos_grid.pack(fill="x", padx=10, pady=(0, 2),
                         after=_atmos_header_row)
         _atmos_bar.pack(fill="x", padx=10, pady=(0, 8), after=atmos_grid)
-        _atmos_toggle_btn.configure(text="▾  ATMOS BED  (5.1 — 6 cells)")
+        _atmos_toggle_btn.configure(text="▾  ATMOS BED  (5.1 — 3 cells)")
     else:
         atmos_grid.pack_forget()
         _atmos_bar.pack_forget()
-        _atmos_toggle_btn.configure(text="▸  ATMOS BED  (5.1 — 6 cells)")
+        _atmos_toggle_btn.configure(text="▸  ATMOS BED  (5.1 — 3 cells)")
     # The row changes the content height, so let the scroll area catch up.
     try:
         _schedule_sf_geometry(30)
@@ -9517,46 +10024,6 @@ _atmos_set_open(False)          # folded until asked for
 STEMS = ["vocals", "drums", "bass", "guitar", "piano", "other"]
 
 stem_sliders = {}   # name -> CTkSlider, so reset buttons can reach them
-_invert_btns = {}
-
-
-def _toggle_invert(key):
-    """Flip a cell's polarity."""
-    state.stem_invert[key] = not state.stem_invert.get(key, False)
-    _paint_invert(key)
-    print(f"[Mixer] {key}: phase {'inverted' if state.stem_invert[key] else 'normal'}")
-
-
-def _paint_invert(key):
-    btn = _invert_btns.get(key)
-    if btn is None:
-        return
-    on = state.stem_invert.get(key, False)
-    try:
-        btn.configure(fg_color="#7a3d00" if on else STEEL,
-                      hover_color="#a35200" if on else STEEL_LIGHT,
-                      text_color=BRIGHT_GREEN if on else TEXT_DIM,
-                      text="Ø PHASE  ON" if on else "Ø PHASE")
-    except Exception:
-        pass
-
-
-def _add_invert_button(cell, key, after=None):
-    """A polarity switch for one cell."""
-    btn = ctk.CTkButton(cell, text="Ø PHASE",
-                        command=lambda k=key: _toggle_invert(k),
-                        fg_color=STEEL, hover_color=STEEL_LIGHT,
-                        text_color=TEXT_DIM,
-                        font=("Courier New", 11, "bold"),
-                        corner_radius=0, border_width=1,
-                        border_color=BORDER, height=18)
-    if after is not None:
-        btn.pack(fill="x", padx=6, pady=(1, 0), after=after)
-    else:
-        btn.pack(fill="x", padx=6, pady=(1, 0))
-    _invert_btns[key] = btn
-    _paint_invert(key)
-    return btn
 
 
 def _paint_ms(key):
@@ -9648,7 +10115,7 @@ def _make_leveller_panel(parent, key):
                     border_color=BORDER, border_width=1,
                     checkbox_width=16, checkbox_height=16).pack(pady=(2, 0))
 
-    for lbl, attr, init, is_thr in [
+    for lbl, attr, init, _ in [
         ("THR", "threshold", 0.3, True),
         ("AMT", "amount",    0.5, False),
     ]:
@@ -9829,7 +10296,7 @@ _DYN_TITLES = {
     "vocals": "VOCALS", "drums": "DRUMS", "bass": "BASS", "guitar": "GUITAR",
     "piano": "PIANO", "other": "OTHER", "instrumental": "INST",
     "front_vocals": "FRT VOX", "bg_vocals": "BG VOX", "hidden_layer": "HID LAYER",
-    "any": "ANY", "any+": "ANY+", "any++": "ANY++",
+    "any": "ANY", "strings": "STRINGS",
 }
 
 
@@ -10219,53 +10686,10 @@ for col_idx, name in enumerate(STEMS):
     _sw_sl.set(1.0)
     _sw_sl.pack(side="left", fill="x", expand=True)
 
-    _rev_row = ctk.CTkFrame(cell, fg_color="transparent")
-    _rev_row.pack(fill="x", padx=4, pady=0)
-    ctk.CTkLabel(_rev_row, text="REV",
-                 font=("Courier New", 13, "bold"),
-                 text_color=TEXT_DIM, width=22).pack(side="left")
-    def _make_rev_cmd(n):
-        def _cmd(v): state.stem_reverbs[n] = float(v)
-        return _cmd
-    LockedSlider(_rev_row, from_=0.0, to=1.0, height=12,
-                 button_color=STEEL, button_hover_color=STEEL_LIGHT,
-                 progress_color=STEEL,
-                 command=_make_rev_cmd(name)).pack(side="left", fill="x", expand=True)
 
-    _air_row = ctk.CTkFrame(cell, fg_color="transparent")
-    _air_row.pack(fill="x", padx=4, pady=0)
-    ctk.CTkLabel(_air_row, text="AIR",
-                 font=("Courier New", 13, "bold"),
-                 text_color=TEXT_DIM, width=22).pack(side="left")
-    def _make_air_cmd(n):
-        def _cmd(v): state.stem_air[n] = float(v)
-        return _cmd
-    _air_s = LockedSlider(_air_row, from_=-1.0, to=1.0, height=12,
-                          button_color=STEEL, button_hover_color=STEEL_LIGHT,
-                          progress_color=STEEL, command=_make_air_cmd(name))
-    _air_s.set(0.0)
-    _air_s.pack(side="left", fill="x", expand=True)
-
-    # NDG (nudge) sliders removed. state.stem_nudge stays empty, so the
-    # mixer treats every stem as un-nudged.
-
-    # ── RST + meter ──────────────────────────────────────────────────────
-    def _make_reset(n, s):
-        def _reset():
-            s.set(1.0)
-            state.stem_volumes[n] = 1.0
-        return _reset
 
     rst_meter_row = ctk.CTkFrame(cell, fg_color="transparent")
     rst_meter_row.pack(pady=(0, 2))
-    ctk.CTkButton(rst_meter_row, text="RST",
-                  command=_make_reset(name, sl),
-                  fg_color=STEEL, hover_color=STEEL_LIGHT,
-                  text_color=TEXT_DIM,
-                  font=("Courier New", 13, "bold"),
-                  corner_radius=0, border_width=1,
-                  border_color=BORDER, height=18, width=36
-                  ).pack(side="left", padx=(0, 4))
     make_meter(rst_meter_row, name).pack(side="left")
 
     # ── COMP / LEVELLER / LIMITER, folded behind one header ─────────────
@@ -10416,49 +10840,9 @@ _fv_sw_sl = LockedSlider(_fv_sw_row, from_=0.0, to=2.0, height=12,
 _fv_sw_sl.set(1.0)
 _fv_sw_sl.pack(side="left", fill="x", expand=True)
 
-# Reverb
-_fv_rev_row = ctk.CTkFrame(fv_cell, fg_color="transparent")
-_fv_rev_row.pack(fill="x", padx=4, pady=0)
-ctk.CTkLabel(_fv_rev_row, text="REV", font=("Courier New", 13, "bold"),
-             text_color=TEXT_DIM, width=22).pack(side="left")
-LockedSlider(_fv_rev_row, from_=0.0, to=1.0, height=12,
-             button_color=STEEL, button_hover_color=STEEL_LIGHT, progress_color=STEEL,
-             command=lambda v: state.stem_reverbs.__setitem__("front_vocals", float(v))
-             ).pack(side="left", fill="x", expand=True)
-
-# Air
-_fv_air_row = ctk.CTkFrame(fv_cell, fg_color="transparent")
-_fv_air_row.pack(fill="x", padx=4, pady=0)
-ctk.CTkLabel(_fv_air_row, text="AIR", font=("Courier New", 13, "bold"),
-             text_color=TEXT_DIM, width=22).pack(side="left")
-_fv_air_sl = LockedSlider(_fv_air_row, from_=-1.0, to=1.0, height=12,
-                           button_color=STEEL, button_hover_color=STEEL_LIGHT, progress_color=STEEL,
-                           command=lambda v: state.stem_air.__setitem__("front_vocals", float(v)))
-_fv_air_sl.set(0.0)
-_fv_air_sl.pack(side="left", fill="x", expand=True)
-
-# NDG (nudge) sliders removed. state.stem_nudge stays empty, so the
-# mixer treats every stem as un-nudged.
-# RST button
-def _reset_fv():
-    fv_vol_sl.set(1.0)
-    setattr(state, "fv_volume", 1.0)
 
 _fv_rst_row = ctk.CTkFrame(fv_cell, fg_color="transparent")
 _fv_rst_row.pack(pady=(0, 2))
-ctk.CTkButton(_fv_rst_row,
-              text="RST",
-              command=_reset_fv,
-              fg_color=STEEL,
-              hover_color=STEEL_LIGHT,
-              text_color=TEXT_DIM,
-              font=("Courier New", 13, "bold"),
-              corner_radius=0,
-              border_width=1,
-              border_color=BORDER,
-              height=18,
-              width=36
-              ).pack(side="left", padx=(0, 4))
 make_meter(_fv_rst_row, "front_vocals").pack(side="left")
 # COMP / LEVELLER / LIMITER, folded behind one header like the main cells
 _fv_dyn_hdr = _make_dynamics_group(fv_cell, "front_vocals")
@@ -10511,13 +10895,21 @@ _solo_btns["bg_vocals"] = _bgv_sb
 # Import button — disabled until main stems are loaded
 def _bgv_separate_now():
     """Re-run the karaoke split for the loaded song."""
-    if state.separating or _kara_separating:
+    if state.separating:
+        print("[Karaoke] The six-stem pass is still running — the split "
+              "follows automatically once it is done")
+        return
+    if _kara_separating:
+        print("[Karaoke] A split is already running")
         return
     if not state.stems or state.stems.get("vocals") is None:
         print("[Karaoke] No vocals stem yet")
         return
     def _resplit():
         _lower_thread_priority()
+        _manual_split[0] = True
+        if state.vocals_lq:
+            print("[Karaoke] Splitting the LQ vocal, as asked")
         separate_bg_vocals()
     threading.Thread(target=_resplit, daemon=True).start()
     if running:
@@ -10670,49 +11062,9 @@ _bgv_sw_sl = LockedSlider(_bgv_sw_row, from_=0.0, to=2.0, height=12,
 _bgv_sw_sl.set(1.0)
 _bgv_sw_sl.pack(side="left", fill="x", expand=True)
 
-# Reverb
-_bgv_rev_row = ctk.CTkFrame(bgv_cell, fg_color="transparent")
-_bgv_rev_row.pack(fill="x", padx=4, pady=0)
-ctk.CTkLabel(_bgv_rev_row, text="REV", font=("Courier New", 13, "bold"),
-             text_color=TEXT_DIM, width=22).pack(side="left")
-LockedSlider(_bgv_rev_row, from_=0.0, to=1.0, height=12,
-             button_color=STEEL, button_hover_color=STEEL_LIGHT, progress_color=STEEL,
-             command=lambda v: state.stem_reverbs.__setitem__("bg_vocals", float(v))
-             ).pack(side="left", fill="x", expand=True)
-
-# Air
-_bgv_air_row = ctk.CTkFrame(bgv_cell, fg_color="transparent")
-_bgv_air_row.pack(fill="x", padx=4, pady=0)
-ctk.CTkLabel(_bgv_air_row, text="AIR", font=("Courier New", 13, "bold"),
-             text_color=TEXT_DIM, width=22).pack(side="left")
-_bgv_air_sl = LockedSlider(_bgv_air_row, from_=-1.0, to=1.0, height=12,
-                            button_color=STEEL, button_hover_color=STEEL_LIGHT, progress_color=STEEL,
-                            command=lambda v: state.stem_air.__setitem__("bg_vocals", float(v)))
-_bgv_air_sl.set(0.0)
-_bgv_air_sl.pack(side="left", fill="x", expand=True)
-
-# NDG (nudge) sliders removed. state.stem_nudge stays empty, so the
-# mixer treats every stem as un-nudged.
-# RST button
-def _reset_bgv():
-    bgv_vol_sl.set(1.0)
-    setattr(state, "bg_vocals_volume", 1.0)
 
 _bgv_rst_row = ctk.CTkFrame(bgv_cell, fg_color="transparent")
 _bgv_rst_row.pack(pady=(0, 2))
-ctk.CTkButton(_bgv_rst_row,
-              text="RST",
-              command=_reset_bgv,
-              fg_color=STEEL,
-              hover_color=STEEL_LIGHT,
-              text_color=TEXT_DIM,
-              font=("Courier New", 13, "bold"),
-              corner_radius=0,
-              border_width=1,
-              border_color=BORDER,
-              height=18,
-              width=36
-              ).pack(side="left", padx=(0, 4))
 make_meter(_bgv_rst_row, "bg_vocals").pack(side="left")
 # COMP / LEVELLER / LIMITER, folded behind one header like the main cells
 _bgv_dyn_hdr = _make_dynamics_group(bgv_cell, "bg_vocals")
@@ -10810,49 +11162,9 @@ _hl_sw_sl = LockedSlider(_hl_sw_row, from_=0.0, to=2.0, height=12,
 _hl_sw_sl.set(1.0)
 _hl_sw_sl.pack(side="left", fill="x", expand=True)
 
-# Reverb
-_hl_rev_row = ctk.CTkFrame(hl_cell, fg_color="transparent")
-_hl_rev_row.pack(fill="x", padx=4, pady=0)
-ctk.CTkLabel(_hl_rev_row, text="REV", font=("Courier New", 13, "bold"),
-             text_color=TEXT_DIM, width=22).pack(side="left")
-LockedSlider(_hl_rev_row, from_=0.0, to=1.0, height=12,
-             button_color=STEEL, button_hover_color=STEEL_LIGHT, progress_color=STEEL,
-             command=lambda v: state.stem_reverbs.__setitem__("hidden_layer", float(v))
-             ).pack(side="left", fill="x", expand=True)
-
-# Air
-_hl_air_row = ctk.CTkFrame(hl_cell, fg_color="transparent")
-_hl_air_row.pack(fill="x", padx=4, pady=0)
-ctk.CTkLabel(_hl_air_row, text="AIR", font=("Courier New", 13, "bold"),
-             text_color=TEXT_DIM, width=22).pack(side="left")
-_hl_air_sl = LockedSlider(_hl_air_row, from_=-1.0, to=1.0, height=12,
-                           button_color=STEEL, button_hover_color=STEEL_LIGHT, progress_color=STEEL,
-                           command=lambda v: state.stem_air.__setitem__("hidden_layer", float(v)))
-_hl_air_sl.set(0.0)
-_hl_air_sl.pack(side="left", fill="x", expand=True)
-
-# NDG (nudge) sliders removed. state.stem_nudge stays empty, so the
-# mixer treats every stem as un-nudged.
-# RST button
-def _reset_hl():
-    hl_vol_sl.set(1.0)
-    setattr(state, "hl_volume", 1.0)
 
 _hl_rst_row = ctk.CTkFrame(hl_cell, fg_color="transparent")
 _hl_rst_row.pack(pady=(0, 2))
-ctk.CTkButton(_hl_rst_row,
-              text="RST",
-              command=_reset_hl,
-              fg_color=STEEL,
-              hover_color=STEEL_LIGHT,
-              text_color=TEXT_DIM,
-              font=("Courier New", 13, "bold"),
-              corner_radius=0,
-              border_width=1,
-              border_color=BORDER,
-              height=18,
-              width=36
-              ).pack(side="left", padx=(0, 4))
 make_meter(_hl_rst_row, "hidden_layer").pack(side="left")
 # COMP / LEVELLER / LIMITER, folded behind one header like the main cells
 _make_dynamics_group(hl_cell, "hidden_layer")
@@ -11006,11 +11318,9 @@ def _make_import_cell(col_idx, label, key, vol_global, load_fn,
     vol_sl.set(1.0)
     vol_sl.pack(fill="x", padx=6, pady=(0, 1))
 
-    for lbl2, from2, to2, init2, dict_ref, def_val in [
+    for lbl2, from2, to2, init2, dict_ref, _ in [
         ("PAN", -1.0, 1.0, 0.0,  state.stem_pan,    0.0),
         ("SW",   0.0, 2.0, 1.0,  state.stem_widths, 1.0),
-        ("REV",  0.0, 1.0, 0.0,  state.stem_reverbs,0.0),
-        ("AIR", -1.0, 1.0, 0.0,  state.stem_air,    0.0),
     ]:
         row = ctk.CTkFrame(cell, fg_color="transparent")
         row.pack(fill="x", padx=4, pady=0)
@@ -11030,14 +11340,6 @@ def _make_import_cell(col_idx, label, key, vol_global, load_fn,
     rst_row = ctk.CTkFrame(cell, fg_color="transparent")
     rst_row.pack(pady=(0, 2))
 
-    def _rst(vg=vol_global, vs=vol_sl):
-        setattr(state, vg, 1.0)
-        vs.set(1.0)
-    ctk.CTkButton(rst_row, text="RST", command=_rst,
-                  fg_color=STEEL, hover_color=STEEL_LIGHT, text_color=TEXT_DIM,
-                  font=("Courier New", 13, "bold"), corner_radius=0,
-                  border_width=1, border_color=BORDER, height=18, width=36
-                  ).pack(side="left", padx=(0, 4))
     make_meter(rst_row, key).pack(side="left")
 
     # COMP / LEVELLER / LIMITER, folded behind one header like the main cells
@@ -11047,16 +11349,10 @@ def _make_import_cell(col_idx, label, key, vol_global, load_fn,
 
 
 any_col   = len(STEMS) + 4
-any_plus_col = len(STEMS) + 5          # kept: the removed ANY+ cell's column
-any_plusplus_col      = len(STEMS) + 6 # kept: the removed ANY++ cell's column
 
 any_import_btn   = None   # filled by _make_import_cell
-any_plus_import_btn = None
-any_plusplus_import_btn      = None
 
 _make_import_cell(any_col,   "ANY",     "any",   "any_volume",   load_any,   "any_import_btn")
-# ANY+ and ANY++ have been replaced by the STRINGS cell below. Their loaders
-# and state stay, so an old session mentioning them still loads.
 
 # ── STRINGS — gilliaan's bowed strings model ───────────────────────────────
 # Laid out like the FRT VOX and BG VOX cells, with the INST cell's AUTO
@@ -11134,10 +11430,7 @@ def _update_strings_status_label():
         if _strings_separating:
             lbl.configure(text="SEPARATING…", text_color="#ffaa00")
         elif state.strings_data is not None:
-            if getattr(state, "strings_is_quick", False):
-                lbl.configure(text="QUICK MIX", text_color="#ffaa00")
-            else:
-                lbl.configure(text="READY", text_color=BRIGHT_GREEN)
+            lbl.configure(text="READY", text_color=BRIGHT_GREEN)
         elif not _str_find_files()[0]:
             lbl.configure(text="NO MODEL", text_color=TEXT_DIM)
         elif not _STR_AUTO:
@@ -11218,49 +11511,9 @@ _strings_sw_sl = LockedSlider(_strings_sw_row, from_=0.0, to=2.0, height=12,
 _strings_sw_sl.set(1.0)
 _strings_sw_sl.pack(side="left", fill="x", expand=True)
 
-# Reverb
-_strings_rev_row = ctk.CTkFrame(_strings_cell, fg_color="transparent")
-_strings_rev_row.pack(fill="x", padx=4, pady=0)
-ctk.CTkLabel(_strings_rev_row, text="REV", font=("Courier New", 13, "bold"),
-             text_color=TEXT_DIM, width=22).pack(side="left")
-LockedSlider(_strings_rev_row, from_=0.0, to=1.0, height=12,
-             button_color=STEEL, button_hover_color=STEEL_LIGHT, progress_color=STEEL,
-             command=lambda v: state.stem_reverbs.__setitem__("strings", float(v))
-             ).pack(side="left", fill="x", expand=True)
-
-# Air
-_strings_air_row = ctk.CTkFrame(_strings_cell, fg_color="transparent")
-_strings_air_row.pack(fill="x", padx=4, pady=0)
-ctk.CTkLabel(_strings_air_row, text="AIR", font=("Courier New", 13, "bold"),
-             text_color=TEXT_DIM, width=22).pack(side="left")
-_strings_air_sl = LockedSlider(_strings_air_row, from_=-1.0, to=1.0, height=12,
-                           button_color=STEEL, button_hover_color=STEEL_LIGHT, progress_color=STEEL,
-                           command=lambda v: state.stem_air.__setitem__("strings", float(v)))
-_strings_air_sl.set(0.0)
-_strings_air_sl.pack(side="left", fill="x", expand=True)
-
-# NDG (nudge) sliders removed. state.stem_nudge stays empty, so the
-# mixer treats every stem as un-nudged.
-# RST button
-def _reset_strings():
-    _strings_vol_sl.set(1.0)
-    setattr(state, "strings_volume", 1.0)
 
 _strings_rst_row = ctk.CTkFrame(_strings_cell, fg_color="transparent")
 _strings_rst_row.pack(pady=(0, 2))
-ctk.CTkButton(_strings_rst_row,
-              text="RST",
-              command=_reset_strings,
-              fg_color=STEEL,
-              hover_color=STEEL_LIGHT,
-              text_color=TEXT_DIM,
-              font=("Courier New", 13, "bold"),
-              corner_radius=0,
-              border_width=1,
-              border_color=BORDER,
-              height=18,
-              width=36
-              ).pack(side="left", padx=(0, 4))
 make_meter(_strings_rst_row, "strings").pack(side="left")
 # COMP / LEVELLER / LIMITER, folded behind one header like the main cells
 _make_dynamics_group(_strings_cell, "strings")
@@ -11292,6 +11545,8 @@ _strings_first_var = ctk.BooleanVar(value=_STR_FIRST)
 def _on_strings_first():
     global _STR_FIRST
     _STR_FIRST = _strings_first_var.get()
+    if _STR_FIRST:
+        _only_one_load_first("strings")
     _update_strings_status_label()
 
 
@@ -11324,25 +11579,44 @@ tk.Frame(_strings_cell, bg=BG, height=4).pack()
 _update_strings_status_label()
 
 # ── ATMOS bed cells ────────────────────────────────────────────────────────
-# Six import slots for the channels of an Atmos 5.1 bed, on their own row
+# Three bed tracks (FRONT, CENTER, REAR) from an Atmos 5.1 bed, on their own row
 # beneath the stem cells. Same controls as the ANY cells.
 _atmos_col = 0
-atmos_fl_import_btn   = None   # filled by _make_import_cell
-atmos_fr_import_btn   = None
-atmos_c_import_btn   = None
-atmos_lfe_import_btn = None
-atmos_bl_import_btn  = None
-atmos_br_import_btn  = None
+atmos_front_import_btn  = None   # filled by _make_import_cell
+atmos_center_import_btn = None
+atmos_rear_import_btn   = None
+load_atmos_front  = _make_atmos_loader("atmos_front",  "ATMOS FRONT",  "atmos_front_import_btn")
+load_atmos_center = _make_atmos_loader("atmos_center", "ATMOS CENTER", "atmos_center_import_btn")
+load_atmos_rear   = _make_atmos_loader("atmos_rear",   "ATMOS REAR",   "atmos_rear_import_btn")
 for _akey, _alabel, _aload in (
-        ("atmos_fl",  "ATMOS FL",  load_atmos_fl),
-        ("atmos_bl",  "ATMOS BL",  load_atmos_bl),
-        ("atmos_c",   "ATMOS C",   load_atmos_c),
-        ("atmos_fr",  "ATMOS FR",  load_atmos_fr),
-        ("atmos_br",  "ATMOS BR",  load_atmos_br),
-        ("atmos_lfe", "ATMOS LFE", load_atmos_lfe)):
+        ("atmos_front",  "ATMOS FRONT",  load_atmos_front),
+        ("atmos_center", "ATMOS CENTER", load_atmos_center),
+        ("atmos_rear",   "ATMOS REAR",   load_atmos_rear)):
     _make_import_cell(_atmos_col, _alabel, _akey, f"{_akey}_volume", _aload,
                       f"{_akey}_import_btn", grid=atmos_grid)
     _atmos_col += 1
+    # This track's own separation status (WAITING, 6-STEM…, HQ: …, LQ / HQ ✓)
+    # and progress bar, under its import button.
+    _abtn = globals().get(f"{_akey}_import_btn")
+    _acell = _abtn
+    while _acell is not None and _acell.master is not atmos_grid:
+        _acell = _acell.master
+    if _acell is not None:
+        _anchor = _abtn
+        while _anchor.master is not _acell:
+            _anchor = _anchor.master
+        _alab = ctk.CTkLabel(_acell, text="", font=("Courier New", 11, "bold"),
+                             text_color="#ffaa00")
+        _alab.pack(after=_anchor, pady=(1, 0))
+        _arow = ctk.CTkFrame(_acell, fg_color="transparent")
+        _abar = ctk.CTkProgressBar(_arow, progress_color=GLOW_RED, fg_color=PANEL,
+                                   corner_radius=0, height=6)
+        _abar.set(0)
+        _abar.pack(fill="x", padx=2)
+        _apct = ctk.CTkLabel(_arow, text="0%", font=("Courier New", 14, "bold"),
+                             text_color=GLOW_RED)
+        _apct.pack()
+        _atmos_cell_ui[_akey] = (_alab, _arow, _abar, _apct)
 
 # ── VOCALS ↔ INSTRUM link ──────────────────────────────────────────────────
 # Muting the vocals, or pulling their fader to the minimum, solos (and
@@ -11417,11 +11691,28 @@ _inst_name_lbl = ctk.CTkLabel(_inst_hdr, text="INST", font=FONT_LABEL,
 
 _inst_key = "instrumental"
 
+def _inst_follow(kind):
+    """Copy INST's mute or solo onto the stems it controls (as a VCA)."""
+    if not getattr(state, "inst_is_vca", False):
+        return False
+    d = state.stem_mute if kind == "mute" else state.stem_solo
+    value = bool(d.get(_inst_key, False))
+    for _k in _INST_CHILDREN:
+        d[_k] = value
+    for _k in (_inst_key,) + _INST_CHILDREN:
+        try:
+            _paint_ms(_k)
+        except (NameError, KeyError):
+            pass
+    return True
+
+
 def _inst_mute():
     global _inst_autosolo_active
     _inst_autosolo_active = False   # manual click wins over the vocals link
     _toggle_mute(_inst_key)
-    _sync_instrumental_overlap()
+    if not _inst_follow("mute"):
+        _sync_instrumental_overlap()
 
 def _inst_solo():
     """Solo works both ways: it un-mutes the instrumental and mutes the
@@ -11437,6 +11728,7 @@ def _inst_solo():
     soloed = not state.stem_solo.get(_inst_key, False)
     state.stem_solo[_inst_key] = soloed
     _paint_ms(_inst_key)
+    _inst_follow("solo")
 
     # A click on S is your decision, not the vocals link's: stop the link
     # from later undoing it when the vocals are touched.
@@ -11529,8 +11821,6 @@ _inst_vol_sl.pack(fill="x", padx=6, pady=(4, 1))
 for _lbl2, _from2, _to2, _init2, _dict2, _def2 in [
     ("PAN", -1.0, 1.0, 0.0, state.stem_pan,    0.0),
     ("SW",   0.0, 2.0, 1.0, state.stem_widths, 1.0),
-    ("REV",  0.0, 1.0, 0.0, state.stem_reverbs,0.0),
-    ("AIR", -1.0, 1.0, 0.0, state.stem_air,    0.0),
 ]:
     _row2 = ctk.CTkFrame(_inst_cell, fg_color="transparent")
     _row2.pack(fill="x", padx=4, pady=0)
@@ -11551,15 +11841,7 @@ for _lbl2, _from2, _to2, _init2, _dict2, _def2 in [
 _inst_rst_row = ctk.CTkFrame(_inst_cell, fg_color="transparent")
 _inst_rst_row.pack(pady=(0, 2))
 
-def _inst_rst(vs=_inst_vol_sl):
-    state.instrumental_vol = 1.0
-    vs.set(1.0)
 
-ctk.CTkButton(_inst_rst_row, text="RST", command=_inst_rst,
-              fg_color=STEEL, hover_color=STEEL_LIGHT, text_color=TEXT_DIM,
-              font=("Courier New", 13, "bold"), corner_radius=0,
-              border_width=1, border_color=BORDER, height=18, width=36
-              ).pack(side="left", padx=(0, 4))
 make_meter(_inst_rst_row, _inst_key).pack(side="left")
 
 
@@ -11612,6 +11894,8 @@ _inst_first_var = ctk.BooleanVar(value=_INST_FIRST)
 def _on_inst_first():
     global _INST_FIRST
     _INST_FIRST = _inst_first_var.get()
+    if _INST_FIRST:
+        _only_one_load_first("inst")
 
 # Instrumental only — skip the six-stem model completely.
 _inst_only_var = ctk.BooleanVar(value=_INST_ONLY)
@@ -11660,11 +11944,9 @@ master_frame.pack(fill="x", padx=20, pady=2)
 
 master_frame.columnconfigure(0, weight=1)
 master_frame.columnconfigure(1, weight=1)
-master_frame.columnconfigure(2, weight=1)
-master_frame.columnconfigure(3, weight=1)
 
 # ── Master control titles ──────────────────────────────────────────────────
-# Size of "MASTER VOLUME", "STEREO WIDTH", "MASTER REVERB" and "MASTER AIR".
+# Size of "MASTER VOLUME" and "STEREO WIDTH".
 # Change the number after "Courier New" to make them bigger or smaller.
 # (If the window is too narrow for the size you pick, the text shrinks to fit
 # automatically and grows back when there is room.)
@@ -11686,15 +11968,12 @@ def _labeled_slider(parent, label, from_, to, init_val, command, col):
                        command=command)
     sl.set(init_val)
     sl.pack(fill="x", padx=10, pady=(0, 8))
+    return sl
 
-_labeled_slider(master_frame, "MASTER VOLUME", 0, 1, state.volume_master,
+_master_vol_sl = _labeled_slider(master_frame, "MASTER VOLUME", 0, 1, state.volume_master,
                 lambda v: setattr(state, "volume_master", float(v)), 0)
-_labeled_slider(master_frame, "STEREO WIDTH",  0, 2, state.stereo_width,
+_master_width_sl = _labeled_slider(master_frame, "STEREO WIDTH",  0, 2, state.stereo_width,
                 lambda v: setattr(state, "stereo_width", float(v)), 1)
-_labeled_slider(master_frame, "MASTER REVERB", 0, 1, state.reverb_master,
-                lambda v: setattr(state, "reverb_master", float(v)), 2)
-_labeled_slider(master_frame, "MASTER AIR",   -1, 1, state.air_master,
-                lambda v: setattr(state, "air_master", float(v)), 3)
 
 
 # ============================================================
@@ -11730,29 +12009,16 @@ for name in STEMS:
                     border_color=STEEL
                     ).pack(side="left", padx=8)
 
-# The instrumental isn't one of state.stems, but export_selected_stems()
-# understands the key, so it gets a checkbox like everything else.
-_inst_check_var = ctk.BooleanVar(value=False)
-stem_check_vars["instrumental"] = _inst_check_var
-ctk.CTkCheckBox(check_row,
-                text="INST",
-                variable=_inst_check_var,
-                font=FONT_SMALL,
-                text_color=TEXT_MAIN,
-                fg_color=RED,
-                hover_color=BRIGHT_RED,
-                checkmark_color="#ffffff",
-                corner_radius=0,
-                border_color=STEEL
-                ).pack(side="left", padx=8)
-
-# The karaoke halves and the strings cell, same as the instrumental: their
-# audio lives outside state.stems, but export_selected_stems() knows where to
-# find it (see _EXPORT_EXTRAS).
-for _xkey, _xlabel in (("front_vocals", "FRT VOX"), ("bg_vocals", "BG VOX"),
-                       ("strings", "STRINGS")):
+# STRINGS, FRT VOX, BG VOX and INST, in the order the mixer shows them (the
+# checkbox order is also the order the files are written in). Their audio
+# lives outside state.stems, but export_selected_stems() knows where to find
+# it (see _EXPORT_EXTRAS).
+for _xkey, _xlabel in (("strings", "STRINGS"), ("front_vocals", "FRT VOX"),
+                       ("bg_vocals", "BG VOX"), ("instrumental", "INST")):
     _xvar = ctk.BooleanVar(value=False)
     stem_check_vars[_xkey] = _xvar
+    if _xkey == "instrumental":
+        _inst_check_var = _xvar
     ctk.CTkCheckBox(check_row,
                     text=_xlabel,
                     variable=_xvar,
@@ -11769,6 +12035,26 @@ fmt_row = ctk.CTkFrame(export_outer, fg_color="transparent")
 fmt_row.pack(pady=(4, 6))
 
 # WAV 24-bit checkbox (left of button)
+# Lossless first: FLAC 16-bit (the default), FLAC 24-bit, WAV 16-bit, then
+# WAV 24-bit — then the write button and the MP3 options.
+def _fmt_checkbox(text, attr):
+    var = ctk.BooleanVar(value=getattr(state, attr))
+
+    def _on():
+        setattr(state, attr, var.get())
+        _save_dirs()
+    ctk.CTkCheckBox(fmt_row, text=text, variable=var, command=_on,
+                    font=FONT_SMALL, text_color=TEXT_MAIN, fg_color=RED,
+                    hover_color=BRIGHT_RED, checkmark_color="#ffffff",
+                    corner_radius=0, border_color=STEEL
+                    ).pack(side="left", padx=(0, 12))
+    return var
+
+
+fmt_flac16_var = _fmt_checkbox("FLAC 16-bit", "export_fmt_flac16")
+fmt_flac24_var = _fmt_checkbox("FLAC 24-bit", "export_fmt_flac24")
+fmt_wav16_var  = _fmt_checkbox("WAV 16-bit",  "export_fmt_wav16")
+
 fmt_wav24_var = ctk.BooleanVar(value=state.export_fmt_wav24)
 def _on_fmt_wav24():
     state.export_fmt_wav24 = fmt_wav24_var.get()
@@ -11808,13 +12094,13 @@ _fmt_mp3_cb = ctk.CTkCheckBox(fmt_row,
                border_color=STEEL)
 _fmt_mp3_cb.pack(side="left", padx=(12, 0))
 
-# MP3 256k checkbox (far right of stems row)
+# MP3 192k checkbox (far right of stems row)
 fmt_mp3_256_var = ctk.BooleanVar(value=state.export_fmt_mp3_256)
 def _on_fmt_mp3_256():
     state.export_fmt_mp3_256 = fmt_mp3_256_var.get()
     _save_dirs()
 _fmt_mp3_256_cb = ctk.CTkCheckBox(fmt_row,
-                text="MP3 256k",
+                text="MP3 192k",
                 variable=fmt_mp3_256_var,
                 command=_on_fmt_mp3_256,
                 font=FONT_SMALL,
@@ -11862,6 +12148,38 @@ ctk.CTkCheckBox(status_row,
                 text="USE GPU",
                 variable=gpu_var,
                 command=set_gpu_mode,
+                font=FONT_SMALL,
+                text_color=TEXT_DIM,
+                fg_color=RED,
+                hover_color=BRIGHT_RED,
+                checkmark_color="#ffffff",
+                corner_radius=0,
+                border_color=STEEL
+                ).pack(side="left", padx=16, pady=4)
+
+# AUTO-RESTART — when the track ends, start it again. On by default; the
+# choice is saved.
+_auto_restart_var = ctk.BooleanVar(value=_AUTO_RESTART[0])
+
+
+def _on_auto_restart():
+    _AUTO_RESTART[0] = bool(_auto_restart_var.get())
+    _save_dirs()
+    print(f"[Transport] Auto-restart {'on' if _AUTO_RESTART[0] else 'off'}")
+
+
+ctk.CTkCheckBox(status_row, text="AUTO-RESTART", variable=_auto_restart_var,
+                command=_on_auto_restart, font=FONT_SMALL, text_color=TEXT_DIM,
+                fg_color=RED, hover_color=BRIGHT_RED, checkmark_color="#ffffff",
+                corner_radius=0, border_color=STEEL
+                ).pack(side="left", padx=16, pady=4)
+
+# KEEP MIX SETTINGS — off by default: each new song starts from a clean
+# mixer. Ticked, faders, pan, width, EQ and dynamics carry over.
+_keep_mix_var = ctk.BooleanVar(value=False)
+ctk.CTkCheckBox(status_row,
+                text="KEEP MIX SETTINGS FOR NEW SONGS",
+                variable=_keep_mix_var,
                 font=FONT_SMALL,
                 text_color=TEXT_DIM,
                 fg_color=RED,
@@ -12242,6 +12560,27 @@ _sai_title_lbl.pack(pady=(6, 2))
 _sai_btn_row = ctk.CTkFrame(_sai_panel, fg_color="transparent")
 _sai_btn_row.pack(pady=(4, 10))
 
+def _mix_fmt_checkbox(parent, text, var, attr):
+    """A format switch for the mix export, sharing the stems panel's setting.
+
+    It uses the very same variable as the EXPORT STEMS checkbox, so ticking
+    a format in either place ticks it in both.
+    """
+    def _on():
+        setattr(state, attr, var.get())
+        _save_dirs()
+    ctk.CTkCheckBox(parent, text=text, variable=var, command=_on,
+                    font=FONT_SMALL, text_color=TEXT_MAIN,
+                    fg_color=RED, hover_color=BRIGHT_RED,
+                    checkmark_color="#ffffff", corner_radius=0,
+                    border_color=STEEL).pack(side="left", padx=(0, 10))
+
+
+for _lbl, _var, _attr in (("FLAC 16-bit", fmt_flac16_var, "export_fmt_flac16"),
+                          ("FLAC 24-bit", fmt_flac24_var, "export_fmt_flac24"),
+                          ("WAV 16-bit",  fmt_wav16_var,  "export_fmt_wav16")):
+    _mix_fmt_checkbox(_sai_btn_row, _lbl, _var, _attr)
+
 _sai_wav24_var = ctk.BooleanVar(value=state.export_fmt_wav24)
 def _on_sai_wav24():
     state.export_fmt_wav24 = _sai_wav24_var.get()
@@ -12286,7 +12625,7 @@ def _on_sai_mp3_256():
     state.export_fmt_mp3_256 = _sai_mp3_256_var.get()
     fmt_mp3_256_var.set(state.export_fmt_mp3_256)
     _save_dirs()
-ctk.CTkCheckBox(_sai_btn_row, text="MP3 256k",
+ctk.CTkCheckBox(_sai_btn_row, text="MP3 192k",
                 variable=_sai_mp3_256_var, command=_on_sai_mp3_256,
                 font=FONT_SMALL, text_color=TEXT_MAIN,
                 fg_color=RED, hover_color=BRIGHT_RED,
@@ -12307,6 +12646,11 @@ ctk.CTkLabel(_eidii_panel,
 
 _eidii_btn_row = ctk.CTkFrame(_eidii_panel, fg_color="transparent")
 _eidii_btn_row.pack(pady=(4, 10))
+
+for _lbl, _var, _attr in (("FLAC 16-bit", fmt_flac16_var, "export_fmt_flac16"),
+                          ("FLAC 24-bit", fmt_flac24_var, "export_fmt_flac24"),
+                          ("WAV 16-bit",  fmt_wav16_var,  "export_fmt_wav16")):
+    _mix_fmt_checkbox(_eidii_btn_row, _lbl, _var, _attr)
 
 _eidii_wav24_var = ctk.BooleanVar(value=state.export_fmt_wav24)
 def _on_eidii_wav24():
@@ -12352,7 +12696,7 @@ def _on_eidii_mp3_256():
     state.export_fmt_mp3_256 = _eidii_mp3_256_var.get()
     fmt_mp3_256_var.set(state.export_fmt_mp3_256)
     _save_dirs()
-ctk.CTkCheckBox(_eidii_btn_row, text="MP3 256k",
+ctk.CTkCheckBox(_eidii_btn_row, text="MP3 192k",
                 variable=_eidii_mp3_256_var, command=_on_eidii_mp3_256,
                 font=FONT_SMALL, text_color="#ff00ff",
                 fg_color="#7700ee", hover_color="#aa00ff",
@@ -12892,6 +13236,14 @@ def _vocals_status_tick():
 _voc_model_wrap = _vocals_sub_ref[0] if _vocals_sub_ref[0] is not None \
     else _vocals_hdr_ref[0]
 
+_lq_btn = ctk.CTkButton(_vocals_cell, text="⇄ LQ 6-STEM VOCAL",
+                        command=_toggle_lq_vocals,
+                        fg_color=STEEL, hover_color=STEEL_LIGHT,
+                        text_color=TEXT_MAIN,
+                        font=("Courier New", 11, "bold"), corner_radius=0,
+                        border_width=1, border_color=BORDER, height=18)
+_lq_btn.pack(fill="x", padx=6, pady=(2, 0), after=_voc_model_wrap)
+
 
 def _update_vocals_status():
     """Say whether these are the rough vocals or the refined ones."""
@@ -12910,7 +13262,7 @@ def _update_vocals_status():
         else:
             _vocals_status_lbl.configure(text="")
         if _vocals_status_lbl.cget("text") and not _vocals_status_lbl.winfo_ismapped():
-            _vocals_status_lbl.pack(after=_voc_model_wrap, pady=(1, 0))
+            _vocals_status_lbl.pack(after=_lq_btn, pady=(1, 0))
         elif not _vocals_status_lbl.cget("text"):
             _vocals_status_lbl.pack_forget()
     except Exception:
@@ -12933,21 +13285,6 @@ def _clear_vocals_progress():
         _vocals_prog_bar.set(0)
         _vocals_prog_lbl.configure(text="0%")
         _vocals_prog_row.pack_forget()
-    except Exception:
-        pass
-
-
-# ── The VOCALS cell steps aside once the split has replaced it ────────────
-def _hide_vocals_cell():
-    """Take VOCALS out of the mixer: FRT VOX and BG VOX hold it now.
-
-    Leaving it in place means the same singing plays from three cells at
-    once, which is both louder than it should be and confusing.
-    """
-    try:
-        if _vocals_cell.winfo_ismapped():
-            _vocals_cell.grid_remove()
-            print("[Mixer] VOCALS replaced by FRT VOX + BG VOX")
     except Exception:
         pass
 
@@ -12997,6 +13334,33 @@ def _on_kara_auto():
 def _on_kara_first():
     global _KARA_FIRST
     _KARA_FIRST = _kara_first_var.get()
+    if _KARA_FIRST:
+        _only_one_load_first("kara")
+
+
+def _only_one_load_first(chosen):
+    """LOAD FIRST can be on for one cell only: ticking it clears the others.
+
+    Each LOAD FIRST asks for its own model to go before the six-stem pass;
+    with several ticked they would compete for "first", so the newest choice
+    wins and the rest are unticked.
+    """
+    for key, var_name, flag in (("strings", "_strings_first_var", "_STR_FIRST"),
+                                ("inst",    "_inst_first_var",    "_INST_FIRST"),
+                                ("kara",    "_kara_first_var",    "_KARA_FIRST")):
+        if key == chosen:
+            continue
+        globals()[flag] = False
+        var = globals().get(var_name)
+        if var is not None:
+            try:
+                var.set(False)
+            except Exception:
+                pass
+    try:
+        _update_strings_status_label()
+    except Exception:
+        pass
 
 
 def _kara_separate_now():
@@ -13073,6 +13437,180 @@ def _cmp_above_controls(cell):
 
 for _c in (_inst_cell, fv_cell, bgv_cell):
     _cmp_above_controls(_c)
+
+# ── Sliders: double-click to reset ─────────────────────────────────────────
+# Each slider goes back to its starting value on a double-click — volume to
+# 1.0, PAN to centre, SW to 1.0.
+_SLIDER_DEFAULTS = {"PAN": 0.0, "SW": 1.0}
+
+
+def _reset_slider(slider, value):
+    try:
+        slider.set(value)
+        cmd = getattr(slider, "_command", None)
+        if cmd is not None:
+            cmd(value)
+    except Exception:
+        pass
+
+
+def _bind_reset(slider, value):
+    slider.bind("<Double-Button-1>",
+                lambda _e, s=slider, v=value: _reset_slider(s, v), add="+")
+    slider._reset_value = value
+
+
+def _tidy_cell(cell):
+    """Give every fader and knob in a cell its double-click reset."""
+    import customtkinter as _ctk
+    for child in list(cell.winfo_children()):
+        if isinstance(child, _ctk.CTkSlider):
+            _bind_reset(child, 1.0)                     # the volume fader
+        elif isinstance(child, (_ctk.CTkFrame, tk.Frame)):
+            kids = child.winfo_children()
+            names = [str(k.cget("text")).strip() for k in kids
+                     if isinstance(k, _ctk.CTkLabel)]
+            for n in names:
+                if n in _SLIDER_DEFAULTS:
+                    for k in kids:
+                        if isinstance(k, _ctk.CTkSlider):
+                            _bind_reset(k, _SLIDER_DEFAULTS[n])
+
+
+for _grid in (mixer_grid, atmos_grid):
+    for _cell in _grid.winfo_children():
+        _tidy_cell(_cell)
+for _cell in (fv_cell, bgv_cell, _strings_cell, _inst_cell):
+    _tidy_cell(_cell)          # already in the grid, but harmless twice
+_bind_reset(_master_vol_sl, 0.7)
+_bind_reset(_master_width_sl, 1.0)
+
+# ── Drag and drop ──────────────────────────────────────────────────────────
+# Drop songs anywhere on the window. The first one loads; any others join
+# the LOADLIST. A Dolby file (E-AC-3 / AC-3) is imported as an Atmos bed.
+# Needs the tkinterdnd2 package (pip install tkinterdnd2); without it the
+# window works as before and the console says how to enable dropping.
+_DROP_SONG_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".aif", ".aiff", ".m4a",
+                   ".aac", ".mp4", ".m4v", ".mov", ".opus", ".wma", ".mkv",
+                   ".webm")
+_DROP_BED_EXTS  = (".eac3", ".ec3", ".ac3")
+
+
+def _on_drop(event):
+    try:
+        paths = list(app.tk.splitlist(event.data))
+    except Exception:
+        paths = [str(event.data)]
+    paths = [p for p in paths if os.path.isfile(p)]
+    beds  = [p for p in paths if p.lower().endswith(_DROP_BED_EXTS)]
+    songs = [p for p in paths if p.lower().endswith(_DROP_SONG_EXTS)]
+    if not beds and not songs:
+        print("[Drop] Nothing RAMMA can open in that drop")
+        return getattr(event, "action", None)
+    if beds:
+        print(f"[Drop] Atmos bed: {os.path.basename(beds[0])}")
+        import_atmos_bed(beds[0])
+        return getattr(event, "action", None)
+    for p in songs:
+        if p not in _playlist_paths:
+            _playlist_paths.append(p)
+    _playlist_refresh()
+    print(f"[Drop] Loading {os.path.basename(songs[0])}"
+          + (f" — {len(songs) - 1} more added to the LOADLIST" if len(songs) > 1 else ""))
+    load_file_path(songs[0])
+    return getattr(event, "action", None)
+
+
+_dnd_install_tried = [False]
+
+
+def _install_tkinterdnd2_in_background():
+    """pip install tkinterdnd2 quietly, then switch drag-and-drop on.
+
+    For installs made before drag-and-drop existed. Runs once per session,
+    off the UI thread, into the same Python RAMMA is running in (so a venv
+    gets it in the venv). Skipped for a built .exe: there sys.executable is
+    RAMMA itself, and "running pip" would start a second copy of RAMMA.
+    """
+    if _dnd_install_tried[0]:
+        return
+    _dnd_install_tried[0] = True
+    if getattr(sys, "frozen", False):
+        print("[Drop] Drag-and-drop is off — this build does not include "
+              "tkinterdnd2")
+        return
+
+    def _work():
+        import subprocess
+        print("[Drop] tkinterdnd2 is not installed — installing it in the "
+              "background so you can drag songs onto the window…")
+        kw = {}
+        if os.name == "nt":
+            kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            r = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q",
+                 "--disable-pip-version-check", "tkinterdnd2"],
+                capture_output=True, text=True, timeout=300, **kw)
+        except Exception as e:
+            print(f"[Drop] Could not run pip ({e}) — install it yourself "
+                  f"with: pip install tkinterdnd2")
+            return
+        if r.returncode != 0:
+            out = (r.stderr or "") + (r.stdout or "")
+            if "externally-managed" in out:
+                # PEP 668: a system-managed Python refuses pip. RAMMA's own
+                # venv (made by RAMMA.bat) is not affected; forcing it here
+                # with --break-system-packages could damage the system's
+                # Python, so that is left as the user's decision.
+                print("[Drop] This Python is managed by the system and "
+                      "refuses pip installs. Start RAMMA with RAMMA.bat (its "
+                      "own venv) or install tkinterdnd2 yourself.")
+            else:
+                tail = out.strip().splitlines()[-1:] or [""]
+                print(f"[Drop] pip could not install tkinterdnd2 ({tail[0]}) — "
+                      f"install it yourself with: pip install tkinterdnd2")
+            return
+        import importlib
+        import site
+        importlib.invalidate_caches()
+        # A per-user install lands in a folder that may not have existed
+        # when RAMMA started, so it is not on the path yet.
+        try:
+            user_site = site.getusersitepackages()
+            if user_site and os.path.isdir(user_site) and user_site not in sys.path:
+                sys.path.append(user_site)
+        except Exception:
+            pass
+        print("[Drop] tkinterdnd2 installed")
+        if running:
+            app.after(0, _enable_drag_and_drop)   # live, no restart needed
+
+    threading.Thread(target=_work, daemon=True).start()
+
+
+def _enable_drag_and_drop():
+    try:
+        from tkinterdnd2 import TkinterDnD, DND_FILES
+    except ImportError:
+        _install_tkinterdnd2_in_background()
+        return False
+    try:
+        TkinterDnD._require(app)        # load the tkdnd extension into this window
+        # Give the existing window the drop methods, without rebuilding it.
+        if not isinstance(app, TkinterDnD.DnDWrapper):
+            app.__class__ = type("RammaDnDWindow",
+                                 (app.__class__, TkinterDnD.DnDWrapper), {})
+        app.drop_target_register(DND_FILES)
+        app.dnd_bind("<<Drop>>", _on_drop)
+        print("[Drop] Drag songs onto the window to load them")
+        return True
+    except Exception as e:
+        print(f"[Drop] Drag-and-drop could not be enabled: {e}")
+        return False
+
+
+_enable_drag_and_drop()
 
 # Credit whichever model each cell is actually going to load.
 sync_model_credits()
