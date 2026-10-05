@@ -1335,7 +1335,7 @@ _UPDATE_FILES  = [
     # "requirements.txt",
     # "RAMMA.bat",
     "models.json",
-    # "tips.txt",     # uncomment once tips.txt is in your repository
+    "tips.txt",     # uncomment once tips.txt is in your repository
 ]
 _UPDATE_CHECK  = True          # look for updates at start-up
 _UPDATE_ASK    = True          # ask before installing; False installs quietly
