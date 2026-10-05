@@ -1,5 +1,7 @@
 # RAMMA v0.667.2 is released!
 
+2026-10-05
+
 Removed: 
 Master AIR, Master Reverb, Air and Reverb.
 Lots and lots of old code.
