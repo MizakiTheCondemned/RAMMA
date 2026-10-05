@@ -1,4 +1,21 @@
-# RAMMA v.0667.1 mini-update #3
+# RAMMA v0.667.2 is released!
+
+Removed: 
+Master AIR, Master Reverb, Air and Reverb.
+Lots and lots of old code.
+Many many bugs. Thanks to megy for the help.
+
+Added and improved:
+The instrumental now sounds extremely good and if you solo guitars with drums, they also sound extremely good. EQ Matrix was updated. Vocals has a high-quality mode that automatically refines the BS6Stem vocals however at times the HQ vocals might cause a dropout, and if so, do use LQ vocals. Backing vocals sound okay but still need a bit of work. Not sure how to handle it, may need to wait for progress in backing vocal separation.
+
+Many changes to ATMOS.
+
+New formats to save to have been added.
+.wav 16, .flac 24, .flac 16. 256kb was changed to 192kb.
+
+The Auto-Restart function was added which allows the user to restart a song that has finished playing, or to simply not restart.
+
+# RAMMA v0.667.1 mini-update #3
 
 2026-10-02
 
