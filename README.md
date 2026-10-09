@@ -1,3 +1,9 @@
+# RAMMA v0.667.21 is released!
+
+2026-10-09
+
+Maaaaany bugs fixed.
+
 # RAMMA v0.667.2 is released!
 
 2026-10-05
