@@ -239,7 +239,7 @@ class LockedSlider(ctk.CTkSlider):
 
 
 app = ctk.CTk()
-app.title("R·A·M·M·A - STEM ENGINE v0.667.2")
+app.title("R·A·M·M·A - STEM ENGINE v0.667.21")
 app.configure(fg_color=BG)
 app.resizable(True, True)
 
@@ -9859,7 +9859,7 @@ header.pack(fill="x", padx=0, pady=0)
 header.pack_propagate(False)
 
 ctk.CTkLabel(header,
-             text="R · A · M · M · A  ──  STEM  ENGINE  v0.667.2",
+             text="R · A · M · M · A  ──  STEM  ENGINE  v0.667.21",
              font=("Courier New", 14, "bold"),
              text_color=GLOW_RED).pack(side="left", padx=20)
 
